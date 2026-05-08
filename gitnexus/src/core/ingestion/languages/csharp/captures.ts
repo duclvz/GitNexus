@@ -53,10 +53,21 @@ export function emitCsharpScopeCaptures(
   // the LanguageProvider contract layer; cast here at the use site.
   let tree = cachedTree as ReturnType<ReturnType<typeof getCsharpParser>['parse']> | undefined;
   if (tree === undefined) {
-    tree = getCsharpParser().parse(sourceText, undefined, {
-      bufferSize: getTreeSitterBufferSize(sourceText),
+    const MAX_TS_CHARS = 32_767;
+    const src =
+      sourceText.length > MAX_TS_CHARS
+        ? sourceText.slice(0, sourceText.lastIndexOf('
+', MAX_TS_CHARS - 1) + 1)
+        : sourceText;
+    tree = getCsharpParser().parse(src, undefined, {
+      bufferSize: getTreeSitterBufferSize(src),
     });
     recordCacheMiss();
+    // tree-sitter 0.21.x on Windows: truncation mid-class gives ERROR root → orphaned scopes.
+    // Return empty so the legacy DAG handles the file silently.
+    if (tree.rootNode.type !== 'compilation_unit') {
+      return [];
+    }
   } else {
     recordCacheHit();
   }

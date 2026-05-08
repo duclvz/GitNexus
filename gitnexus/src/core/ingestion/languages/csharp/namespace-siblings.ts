@@ -54,10 +54,16 @@ interface CsharpFileStructure {
  *  shared across calls. */
 function extractFileStructure(content: string, cachedTree: unknown): CsharpFileStructure {
   type CsharpTree = ReturnType<ReturnType<typeof getCsharpParser>['parse']>;
+  const MAX_TS_CHARS = 32_767;
+  const src =
+    content.length > MAX_TS_CHARS
+      ? content.slice(0, content.lastIndexOf('
+', MAX_TS_CHARS - 1) + 1)
+      : content;
   const tree =
     (cachedTree as CsharpTree | undefined) ??
-    getCsharpParser().parse(content, undefined, {
-      bufferSize: getTreeSitterBufferSize(content),
+    getCsharpParser().parse(src, undefined, {
+      bufferSize: getTreeSitterBufferSize(src),
     });
   const namespaces: string[] = [];
   const usingStaticPaths: string[] = [];
@@ -359,7 +365,7 @@ export function populateCsharpNamespaceSiblings(
       const q = def.qualifiedName ?? '';
       const key = q.includes('.') ? q.slice(q.lastIndexOf('.') + 1) : q;
       if (key === '') continue;
-      const arr = defsByName.get(key) ?? [];
+      const arr = [...(defsByName.get(key) ?? [])];
       arr.push(def);
       defsByName.set(key, arr);
     }

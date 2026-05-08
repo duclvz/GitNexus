@@ -1409,6 +1409,14 @@ const processFileGroup = (
 
     clearCaches(); // Reset memoization before each new file
 
+    // tree-sitter 0.21.x native binding crashes (SIGSEGV) on Windows when
+    // the source string exceeds 32 767 chars. Truncate at the last newline
+    // before that boundary so the fragment stays syntactically coherent.
+    const MAX_TS_CHARS = 32_767;
+    if (parseContent.length > MAX_TS_CHARS) {
+      parseContent = parseContent.slice(0, parseContent.lastIndexOf('
+', MAX_TS_CHARS - 1) + 1);
+    }
     let tree;
     try {
       tree = parser.parse(parseContent, undefined, {

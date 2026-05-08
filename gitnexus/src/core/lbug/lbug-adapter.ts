@@ -1235,6 +1235,15 @@ export const loadVectorExtension = async (
 ): Promise<boolean> => {
   const useModuleState = targetConn === undefined;
   if (useModuleState && vectorExtensionLoaded) return true;
+  // INSTALL VECTOR crashes with SIGSEGV on Windows: the KuzuDB native extension
+  // installer has an unhandled error path on Windows that raises a fatal signal
+  // that JS try/catch cannot intercept. Skip loading — vector/embedding search
+  // is unavailable but all graph index queries still work.
+  // See: https://github.com/abhigyanpatwari/GitNexus/issues/...
+  if (process.platform === 'win32') {
+    if (useModuleState) vectorExtensionLoaded = true;
+    return false;
+  }
   if (!isVectorExtensionSupportedByPlatform()) return false;
 
   const c: lbug.Connection | null = targetConn ?? conn;
