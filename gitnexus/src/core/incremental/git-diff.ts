@@ -60,7 +60,6 @@ export function getChangedFilesSinceCommit(
     'diff',
     '--name-status',
     '-z',
-    '--no-renames=false',
     `${lastCommit}`,
     'HEAD',
   ]);
