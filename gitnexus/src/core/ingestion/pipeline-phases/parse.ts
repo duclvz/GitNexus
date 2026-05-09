@@ -96,9 +96,18 @@ export const parsePhase: PipelinePhase<ParseOutput> = {
       'structure',
     );
 
+    // Incremental-indexing filter: when `filesToParse` is set, only the
+    // closure files get parsed in this run. Files outside the closure had
+    // their nodes/edges pre-loaded by the `hydrate` phase. See
+    // docs/superpowers/specs/2026-05-10-incremental-indexing-design.md.
+    const filesToParse = ctx.options?.filesToParse;
+    const targetScanned = filesToParse
+      ? scannedFiles.filter((f) => filesToParse.has(f.path))
+      : scannedFiles;
+
     const result = await runChunkedParseAndResolve(
       ctx.graph,
-      scannedFiles,
+      targetScanned,
       allPaths,
       totalFiles,
       ctx.repoPath,

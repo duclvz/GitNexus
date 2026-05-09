@@ -9,6 +9,7 @@
 
 export { scanPhase, type ScanOutput } from './scan.js';
 export { structurePhase, type StructureOutput } from './structure.js';
+export { hydratePhase, type HydrateOutput } from './hydrate.js';
 export { markdownPhase, type MarkdownOutput } from './markdown.js';
 export { cobolPhase, type CobolOutput } from './cobol.js';
 export { parsePhase, type ParseOutput } from './parse.js';
