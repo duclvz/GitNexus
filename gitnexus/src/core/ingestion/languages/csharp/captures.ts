@@ -89,8 +89,7 @@ export function emitCsharpScopeCaptures(
     const MAX_TS_CHARS = 32_767;
     const src =
       sourceText.length > MAX_TS_CHARS
-        ? sourceText.slice(0, sourceText.lastIndexOf('
-', MAX_TS_CHARS - 1) + 1)
+        ? sourceText.slice(0, sourceText.lastIndexOf('\n', MAX_TS_CHARS - 1) + 1)
         : sourceText;
     tree = getCsharpParser().parse(src, undefined, {
       bufferSize: getTreeSitterBufferSize(src),

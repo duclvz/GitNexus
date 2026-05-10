@@ -57,8 +57,7 @@ function extractFileStructure(content: string, cachedTree: unknown): CsharpFileS
   const MAX_TS_CHARS = 32_767;
   const src =
     content.length > MAX_TS_CHARS
-      ? content.slice(0, content.lastIndexOf('
-', MAX_TS_CHARS - 1) + 1)
+      ? content.slice(0, content.lastIndexOf('\n', MAX_TS_CHARS - 1) + 1)
       : content;
   const tree =
     (cachedTree as CsharpTree | undefined) ??

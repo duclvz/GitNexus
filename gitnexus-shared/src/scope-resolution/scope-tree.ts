@@ -230,17 +230,6 @@ function rangeStrictlyContains(outer: Range, inner: Range): boolean {
   return outerStartsAtOrBefore && outerEndsAtOrAfter;
 }
 
-/** Non-strict containment for Module parents: outer == inner is allowed. */
-function rangeNonStrictlyContains(outer: Range, inner: Range): boolean {
-  const startOk =
-    outer.startLine < inner.startLine ||
-    (outer.startLine === inner.startLine && outer.startCol <= inner.startCol);
-  const endOk =
-    outer.endLine > inner.endLine ||
-    (outer.endLine === inner.endLine && outer.endCol >= inner.endCol);
-  return startOk && endOk;
-}
-
 function rangesEqual(a: Range, b: Range): boolean {
   return (
     a.startLine === b.startLine &&

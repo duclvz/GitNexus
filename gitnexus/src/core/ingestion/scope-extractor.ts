@@ -321,23 +321,6 @@ function draftToScope(draft: ScopeDraft): Scope {
   };
 }
 
-/** Non-strict containment when the outer scope is a Module (compilation_unit).
- *  Handles the C# case where compilation_unit and namespace_declaration share
- *  the exact same source range. */
-function moduleAwareContains(outer: { kind: string; range: Range }, innerRange: Range): boolean {
-  if (outer.kind === 'Module') {
-    const o = outer.range;
-    const startOk =
-      o.startLine < innerRange.startLine ||
-      (o.startLine === innerRange.startLine && o.startCol <= innerRange.startCol);
-    const endOk =
-      o.endLine > innerRange.endLine ||
-      (o.endLine === innerRange.endLine && o.endCol >= innerRange.endCol);
-    return startOk && endOk;
-  }
-  return canParentScope(outer.range, innerRange, outer.kind as ScopeKind, outer.kind as ScopeKind);
-}
-
 // ─── Pass 1: build scope tree ──────────────────────────────────────────────
 
 /**

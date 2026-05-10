@@ -1419,8 +1419,7 @@ const processFileGroup = (
     // before that boundary so the fragment stays syntactically coherent.
     const MAX_TS_CHARS = 32_767;
     if (parseContent.length > MAX_TS_CHARS) {
-      parseContent = parseContent.slice(0, parseContent.lastIndexOf('
-', MAX_TS_CHARS - 1) + 1);
+      parseContent = parseContent.slice(0, parseContent.lastIndexOf('\n', MAX_TS_CHARS - 1) + 1);
     }
     let tree;
     try {
