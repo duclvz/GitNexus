@@ -135,6 +135,11 @@ export async function runChunkedParseAndResolve(
    *  source. See plan
    *  docs/plans/2026-04-20-002-perf-parse-heritage-mro-plan.md (Unit 4). */
   scopeTreeCache: ASTCache;
+  /** Worker-produced ParsedFile artifacts aggregated across chunks.
+   *  Threaded into scope-resolution as a re-extract cache so the warm-
+   *  cache analyze run can skip the dominant `extractParsedFile` cost
+   *  (otherwise ~58s on a 1000-file repo). */
+  parsedFiles: import('gitnexus-shared').ParsedFile[];
 }> {
   const ctx = createResolutionContext();
   const symbolTable = ctx.model.symbols;
@@ -157,6 +162,14 @@ export async function runChunkedParseAndResolve(
       `Skipping ${count} ${lang} file(s) — ${lang} parser not available (native binding may not have built). Try: npm rebuild tree-sitter-${lang}`,
     );
   }
+
+  // Sort by path so chunk membership is stable across runs even when
+  // the filesystem returns scan order non-deterministically. Without
+  // this, the parse cache misses on every run because chunk boundaries
+  // shift even when no source file content has changed. Sort is
+  // ascending alphabetical — the comparator works for both POSIX and
+  // Windows path separators since both are `string` in JS.
+  parseableScanned.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
   const totalParseable = parseableScanned.length;
 
@@ -287,6 +300,12 @@ export async function runChunkedParseAndResolve(
   const deferredWorkerHeritage: ExtractedHeritage[] = [];
   const deferredConstructorBindings: FileConstructorBindings[] = [];
   const deferredAssignments: ExtractedAssignment[] = [];
+  // Aggregated per-file ParsedFile artifacts produced by workers' calls
+  // to `extractParsedFile`. Threaded through to the scope-resolution
+  // phase so it can SKIP its own re-extraction on cache hits — this is
+  // the second-half of the parse-cache speedup since scope-resolution's
+  // re-parse otherwise dominates the warm-cache wall-clock time.
+  const allParsedFiles: import('gitnexus-shared').ParsedFile[] = [];
 
   // Incremental parse cache (Option B): chunk-level content-addressed.
   // When the chunk's (filePath, content-hash) signature matches a prior
@@ -428,6 +447,12 @@ export async function runChunkedParseAndResolve(
         for (const item of chunkWorkerData.heritage) deferredWorkerHeritage.push(item);
         for (const item of chunkWorkerData.constructorBindings)
           deferredConstructorBindings.push(item);
+        // Aggregate worker-produced ParsedFile artifacts so scope-
+        // resolution can use them as a re-extraction cache (skips its
+        // own tree-sitter re-parse on warm runs).
+        if (chunkWorkerData.parsedFiles?.length) {
+          for (const item of chunkWorkerData.parsedFiles) allParsedFiles.push(item);
+        }
         if (chunkWorkerData.assignments?.length) {
           for (const item of chunkWorkerData.assignments) deferredAssignments.push(item);
         }
@@ -700,5 +725,12 @@ export async function runChunkedParseAndResolve(
     // chunk-local `astCache` above is intentionally NOT exposed
     // because parse-impl clears it between chunks.
     scopeTreeCache,
+    // Per-file ParsedFile artifacts produced by workers' calls to
+    // `extractParsedFile`. Empty when only the sequential path ran
+    // (sequential doesn't go through the worker, and extracts ParsedFile
+    // inline rather than emitting it). Consumed by scope-resolution as
+    // a re-extraction cache: when the file's ParsedFile is here,
+    // scope-resolution skips its own `extractParsedFile` call.
+    parsedFiles: allParsedFiles,
   };
 }

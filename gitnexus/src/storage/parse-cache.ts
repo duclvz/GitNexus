@@ -68,6 +68,33 @@ export const computeChunkHash = (entries: Array<{ filePath: string; contentHash:
 };
 
 /**
+ * JSON replacer that round-trips Map/Set instances through plain JSON.
+ *
+ * `ParseWorkerResult.parsedFiles[*].scopes[*].typeBindings` is a
+ * `ReadonlyMap<string, TypeRef>`; without this transform it serializes
+ * to `{}` and downstream code that iterates / `.get()`s on it crashes
+ * with "is not iterable". Applied symmetrically by `mapReviver` on
+ * load so the in-memory shape stays Map-typed.
+ */
+const MAP_TAG = '__$mapEntries$__';
+const SET_TAG = '__$setValues$__';
+
+const mapReplacer = (_key: string, value: unknown): unknown => {
+  if (value instanceof Map) return { [MAP_TAG]: Array.from(value.entries()) };
+  if (value instanceof Set) return { [SET_TAG]: Array.from(value.values()) };
+  return value;
+};
+
+const mapReviver = (_key: string, value: unknown): unknown => {
+  if (value && typeof value === 'object') {
+    const v = value as Record<string, unknown>;
+    if (Array.isArray(v[MAP_TAG])) return new Map(v[MAP_TAG] as [unknown, unknown][]);
+    if (Array.isArray(v[SET_TAG])) return new Set(v[SET_TAG] as unknown[]);
+  }
+  return value;
+};
+
+/**
  * Load the parse cache. Returns an empty cache on any failure (missing
  * file, corrupt JSON, version mismatch). Never throws on a normal load.
  */
@@ -75,7 +102,7 @@ export const loadParseCache = async (storagePath: string): Promise<ParseCache> =
   const cachePath = path.join(storagePath, CACHE_FILENAME);
   try {
     const raw = await fs.readFile(cachePath, 'utf-8');
-    const data = JSON.parse(raw) as ParseCacheFile;
+    const data = JSON.parse(raw, mapReviver) as ParseCacheFile;
     if (
       typeof data !== 'object' ||
       data === null ||
@@ -112,7 +139,7 @@ export const saveParseCache = async (
   };
   // Compact JSON; this file can be tens of MB on a large repo and pretty-
   // printing roughly doubles size for no value.
-  await fs.writeFile(tmpPath, JSON.stringify(out), 'utf-8');
+  await fs.writeFile(tmpPath, JSON.stringify(out, mapReplacer), 'utf-8');
   await fs.rename(tmpPath, cachePath);
 };
 
