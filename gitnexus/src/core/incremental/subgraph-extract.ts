@@ -23,8 +23,7 @@ import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
 import { createKnowledgeGraph } from '../graph/graph.js';
 import type { KnowledgeGraph } from '../graph/types.js';
 
-const isGraphWide = (label: string): boolean =>
-  label === 'Community' || label === 'Process';
+const isGraphWide = (label: string): boolean => label === 'Community' || label === 'Process';
 
 export const extractChangedSubgraph = (
   fullGraph: KnowledgeGraph,

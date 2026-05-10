@@ -61,7 +61,9 @@ export const fileContentHash = (content: Buffer | string): string => sha256Hex(c
  * in the chunk. We sort by filePath before hashing so chunks composed of
  * the same files in different order produce the same key.
  */
-export const computeChunkHash = (entries: Array<{ filePath: string; contentHash: string }>): string => {
+export const computeChunkHash = (
+  entries: Array<{ filePath: string; contentHash: string }>,
+): string => {
   const sorted = [...entries].sort((a, b) => (a.filePath < b.filePath ? -1 : 1));
   const joined = sorted.map((e) => `${e.filePath}:${e.contentHash}`).join('\n');
   return sha256Hex(joined);
@@ -126,10 +128,7 @@ export const loadParseCache = async (storagePath: string): Promise<ParseCache> =
  * Persist the cache to disk atomically (write-and-rename) so a crash
  * mid-write doesn't leave a corrupt file.
  */
-export const saveParseCache = async (
-  storagePath: string,
-  cache: ParseCache,
-): Promise<void> => {
+export const saveParseCache = async (storagePath: string, cache: ParseCache): Promise<void> => {
   await fs.mkdir(storagePath, { recursive: true });
   const cachePath = path.join(storagePath, CACHE_FILENAME);
   const tmpPath = `${cachePath}.tmp`;

@@ -181,7 +181,7 @@ export async function runFullAnalysis(
 
   const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
-  let existingMeta = await loadMeta(storagePath);
+  const existingMeta = await loadMeta(storagePath);
 
   // ── Crash recovery: dirty flag forces full rebuild ────────────────
   // If the previous incremental run set incrementalInProgress and didn't
@@ -332,7 +332,9 @@ export async function runFullAnalysis(
     (p) => {
       const phaseLabel = PHASE_LABELS[p.phase] || p.phase;
       const scaled = Math.round(p.percent * 0.6);
-      const message = p.detail ? `${p.message || phaseLabel} (${p.detail})` : p.message || phaseLabel;
+      const message = p.detail
+        ? `${p.message || phaseLabel} (${p.detail})`
+        : p.message || phaseLabel;
       progress(p.phase, scaled, message);
     },
     { parseCache },
@@ -416,11 +418,7 @@ export async function runFullAnalysis(
           /* file may not have rows (e.g. an unparseable file) — fine */
         }
         if (i % 20 === 0) {
-          progress(
-            'lbug',
-            62,
-            `Removing rows for changed files (${i}/${filesToDelete.length})...`,
-          );
+          progress('lbug', 62, `Removing rows for changed files (${i}/${filesToDelete.length})...`);
         }
       }
       // 2. Drop graph-wide nodes (Community, Process). They'll be re-inserted
@@ -430,10 +428,7 @@ export async function runFullAnalysis(
 
       // 3. Extract the changed subgraph from the FULL ctx.graph and write
       //    only that. Unchanged-file rows in the DB stay untouched.
-      const subgraph = extractChangedSubgraph(
-        pipelineResult.graph,
-        new Set(hashDiff.toWrite),
-      );
+      const subgraph = extractChangedSubgraph(pipelineResult.graph, new Set(hashDiff.toWrite));
       await loadGraphToLbug(subgraph, pipelineResult.repoPath, storagePath, (msg) => {
         lbugMsgCount++;
         const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
@@ -641,9 +636,7 @@ export async function runFullAnalysis(
       // dirty flag (full and incremental success paths converge here).
       schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
       fileHashes: hasGitDir(repoPath) ? newFileHashesRecord : undefined,
-      incrementalInProgress: undefined as
-        | { startedAt: number; toWriteCount: number }
-        | undefined,
+      incrementalInProgress: undefined as { startedAt: number; toWriteCount: number } | undefined,
     };
     await saveMeta(storagePath, meta);
 

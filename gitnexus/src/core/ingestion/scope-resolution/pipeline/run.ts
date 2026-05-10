@@ -149,9 +149,7 @@ export function runScopeResolution(
     parsedFiles.push(parsed);
   }
   if (PROF && preExtracted !== undefined) {
-    logger.warn(
-      `[scope-resolution prof] pre-extracted hits: ${preExtractedHits}/${files.length}`,
-    );
+    logger.warn(`[scope-resolution prof] pre-extracted hits: ${preExtractedHits}/${files.length}`);
   }
   provider.populateWorkspaceOwners?.(parsedFiles, { fileContents: getFileContents() });
 
