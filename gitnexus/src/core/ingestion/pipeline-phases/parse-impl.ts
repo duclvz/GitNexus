@@ -17,7 +17,10 @@ import {
   enrichExportedTypeMap,
   type BindingEntry,
 } from '../binding-accumulator.js';
-import { processParsing } from '../parsing-processor.js';
+import { processParsing, mergeChunkResults } from '../parsing-processor.js';
+import { fileContentHash, computeChunkHash } from '../../../storage/parse-cache.js';
+import type { ParseWorkerResult } from '../workers/parse-worker.js';
+import type { WorkerExtractedData } from '../parsing-processor.js';
 import {
   processImports,
   processImportsFromExtracted,
@@ -272,6 +275,14 @@ export async function runChunkedParseAndResolve(
   const deferredConstructorBindings: FileConstructorBindings[] = [];
   const deferredAssignments: ExtractedAssignment[] = [];
 
+  // Incremental parse cache (Option B): chunk-level content-addressed.
+  // When the chunk's (filePath, content-hash) signature matches a prior
+  // run's, replay the cached ParseWorkerResult[] instead of dispatching
+  // to workers. See gitnexus/src/storage/parse-cache.ts.
+  const parseCache = options?.parseCache;
+  let chunkCacheHits = 0;
+  let chunkCacheMisses = 0;
+
   try {
     for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
       const chunkPaths = chunks[chunkIdx];
@@ -281,29 +292,79 @@ export async function runChunkedParseAndResolve(
         .filter((p) => chunkContents.has(p))
         .map((p) => ({ path: p, content: chunkContents.get(p)! }));
 
-      const chunkWorkerData = await processParsing(
-        graph,
-        chunkFiles,
-        symbolTable,
-        astCache,
-        scopeTreeCache,
-        (current, _total, filePath) => {
-          const globalCurrent = filesParsedSoFar + current;
-          const parsingProgress = 20 + (globalCurrent / totalParseable) * 62;
-          onProgress({
-            phase: 'parsing',
-            percent: Math.round(parsingProgress),
-            message: `Parsing chunk ${chunkIdx + 1}/${numChunks}...`,
-            detail: filePath,
-            stats: {
-              filesProcessed: globalCurrent,
-              totalFiles: totalParseable,
-              nodesCreated: graph.nodeCount,
-            },
-          });
-        },
-        workerPool,
-      );
+      // Compute the chunk's content-hash signature (if cache available).
+      let chunkHash: string | null = null;
+      if (parseCache) {
+        const entries = chunkFiles.map((f) => ({
+          filePath: f.path,
+          contentHash: fileContentHash(f.content),
+        }));
+        chunkHash = computeChunkHash(entries);
+      }
+
+      let chunkWorkerData: WorkerExtractedData | null;
+      const cachedRaw = chunkHash ? parseCache!.entries.get(chunkHash) : undefined;
+
+      if (cachedRaw && cachedRaw.length > 0) {
+        // Cache hit: replay the cached worker output through the same
+        // merge logic the live worker path uses.
+        chunkCacheHits++;
+        chunkWorkerData = mergeChunkResults(graph, symbolTable, cachedRaw);
+        if (isDev) {
+          logger.info(
+            `📦 parse-cache hit: chunk ${chunkIdx + 1}/${numChunks} (${chunkFiles.length} files, ${chunkHash!.slice(0, 8)})`,
+          );
+        }
+        // Progress update so UI advances even on a cache hit.
+        const cachedFiles = chunkFiles.length;
+        onProgress({
+          phase: 'parsing',
+          percent: Math.round(20 + ((filesParsedSoFar + cachedFiles) / totalParseable) * 62),
+          message: `Parsing chunk ${chunkIdx + 1}/${numChunks} (cache)...`,
+          stats: {
+            filesProcessed: filesParsedSoFar + cachedFiles,
+            totalFiles: totalParseable,
+            nodesCreated: graph.nodeCount,
+          },
+        });
+      } else {
+        // Cache miss: dispatch to workers, capture the raw results, store
+        // them under the chunk hash for the next run.
+        chunkCacheMisses++;
+        const rawResults: ParseWorkerResult[] = [];
+        chunkWorkerData = await processParsing(
+          graph,
+          chunkFiles,
+          symbolTable,
+          astCache,
+          scopeTreeCache,
+          (current, _total, filePath) => {
+            const globalCurrent = filesParsedSoFar + current;
+            const parsingProgress = 20 + (globalCurrent / totalParseable) * 62;
+            onProgress({
+              phase: 'parsing',
+              percent: Math.round(parsingProgress),
+              message: `Parsing chunk ${chunkIdx + 1}/${numChunks}...`,
+              detail: filePath,
+              stats: {
+                filesProcessed: globalCurrent,
+                totalFiles: totalParseable,
+                nodesCreated: graph.nodeCount,
+              },
+            });
+          },
+          workerPool,
+          // Capture raw results only when we have a cache to write to —
+          // otherwise we'd retain extra arrays for nothing.
+          parseCache && chunkHash ? rawResults : undefined,
+        );
+        // Persist the raw results for this chunk hash. Sequential path
+        // doesn't populate rawResults (it writes directly to graph), so
+        // small repos without worker pool simply don't cache. That's fine.
+        if (parseCache && chunkHash && rawResults.length > 0) {
+          parseCache.entries.set(chunkHash, rawResults);
+        }
+      }
 
       const chunkBasePercent = 20 + (filesParsedSoFar / totalParseable) * 62;
 

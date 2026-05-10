@@ -1,0 +1,138 @@
+/**
+ * Chunk-level content-addressed parse cache.
+ *
+ * The pipeline always parses every file (correctness invariant: cross-file
+ * resolution and downstream phases need full graph data). What this cache
+ * does is skip the tree-sitter worker dispatch when a chunk's contents
+ * haven't changed since the last run.
+ *
+ * Granularity: chunk-level. The parse phase chunks files into ~20MB byte
+ * budgets. The cache key is `sha256(joined(filePath:contentHash for each
+ * file in the chunk, sorted))`. A change to a single file invalidates only
+ * that file's chunk — typically 1 of ~50 chunks on a 1000-file repo.
+ *
+ * Why not per-file:
+ * - Workers process sub-batches and emit aggregated `ParseWorkerResult`s.
+ *   Splitting back to per-file would require reworking the worker contract.
+ * - Chunk-level invalidation gives a useful speedup floor (98% on a single
+ *   1-of-50 invalidated chunk) without touching the worker.
+ *
+ * Survives `--force` because it's content-addressed: the same bytes always
+ * produce the same key. `--force` only matters for the LadybugDB writeback;
+ * the cache itself is always safe to reuse.
+ */
+
+import { createHash } from 'crypto';
+import fs from 'fs/promises';
+import path from 'path';
+import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.js';
+
+/** Bump on incompatible changes to ParseWorkerResult or upstream parse semantics. */
+export const PARSE_CACHE_VERSION = 1;
+
+const CACHE_FILENAME = 'parse-cache.json';
+
+/** On-disk shape. */
+interface ParseCacheFile {
+  version: number;
+  /** key = chunk hash (hex) → cached chunk result list. */
+  entries: Record<string, ParseWorkerResult[]>;
+}
+
+/** Runtime view: keyed Map for fast lookup; mutated in place during a run. */
+export interface ParseCache {
+  version: number;
+  entries: Map<string, ParseWorkerResult[]>;
+}
+
+/** SHA-256 hex of a single string or buffer. */
+const sha256Hex = (input: Buffer | string): string =>
+  createHash('sha256')
+    .update(typeof input === 'string' ? Buffer.from(input) : input)
+    .digest('hex');
+
+/** Stable hash of a single file's contents — used by callers to compose a chunk hash. */
+export const fileContentHash = (content: Buffer | string): string => sha256Hex(content);
+
+/**
+ * Compute the canonical cache key for a chunk's contents.
+ *
+ * `entries` is the list of (filePath, file content hash) for every file
+ * in the chunk. We sort by filePath before hashing so chunks composed of
+ * the same files in different order produce the same key.
+ */
+export const computeChunkHash = (entries: Array<{ filePath: string; contentHash: string }>): string => {
+  const sorted = [...entries].sort((a, b) => (a.filePath < b.filePath ? -1 : 1));
+  const joined = sorted.map((e) => `${e.filePath}:${e.contentHash}`).join('\n');
+  return sha256Hex(joined);
+};
+
+/**
+ * Load the parse cache. Returns an empty cache on any failure (missing
+ * file, corrupt JSON, version mismatch). Never throws on a normal load.
+ */
+export const loadParseCache = async (storagePath: string): Promise<ParseCache> => {
+  const cachePath = path.join(storagePath, CACHE_FILENAME);
+  try {
+    const raw = await fs.readFile(cachePath, 'utf-8');
+    const data = JSON.parse(raw) as ParseCacheFile;
+    if (
+      typeof data !== 'object' ||
+      data === null ||
+      data.version !== PARSE_CACHE_VERSION ||
+      typeof data.entries !== 'object' ||
+      data.entries === null
+    ) {
+      return emptyCache();
+    }
+    const entries = new Map<string, ParseWorkerResult[]>();
+    for (const [k, v] of Object.entries(data.entries)) {
+      if (Array.isArray(v)) entries.set(k, v as ParseWorkerResult[]);
+    }
+    return { version: PARSE_CACHE_VERSION, entries };
+  } catch {
+    return emptyCache();
+  }
+};
+
+/**
+ * Persist the cache to disk atomically (write-and-rename) so a crash
+ * mid-write doesn't leave a corrupt file.
+ */
+export const saveParseCache = async (
+  storagePath: string,
+  cache: ParseCache,
+): Promise<void> => {
+  await fs.mkdir(storagePath, { recursive: true });
+  const cachePath = path.join(storagePath, CACHE_FILENAME);
+  const tmpPath = `${cachePath}.tmp`;
+  const out: ParseCacheFile = {
+    version: cache.version,
+    entries: Object.fromEntries(cache.entries),
+  };
+  // Compact JSON; this file can be tens of MB on a large repo and pretty-
+  // printing roughly doubles size for no value.
+  await fs.writeFile(tmpPath, JSON.stringify(out), 'utf-8');
+  await fs.rename(tmpPath, cachePath);
+};
+
+/**
+ * Drop entries whose hashes are not in `usedHashes`. Called at the end
+ * of a run so chunks that no longer correspond to any current chunk
+ * don't keep their stale entries forever.
+ */
+export const pruneCache = (cache: ParseCache, usedHashes: ReadonlySet<string>): number => {
+  let removed = 0;
+  for (const k of cache.entries.keys()) {
+    if (!usedHashes.has(k)) {
+      cache.entries.delete(k);
+      removed++;
+    }
+  }
+  return removed;
+};
+
+const emptyCache = (): ParseCache => ({
+  version: PARSE_CACHE_VERSION,
+  entries: new Map<string, ParseWorkerResult[]>(),
+});

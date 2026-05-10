@@ -36,6 +36,7 @@ import {
 } from '../storage/repo-manager.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import { extractChangedSubgraph } from './incremental/subgraph-extract.js';
+import { loadParseCache, saveParseCache } from '../storage/parse-cache.js';
 import {
   getCurrentCommit,
   getRemoteUrl,
@@ -318,13 +319,24 @@ export async function runFullAnalysis(
     }
   }
 
+  // ── Load incremental parse cache ──────────────────────────────────
+  // Content-addressed: safe to reuse across `--force` runs (chunks whose
+  // file contents haven't changed produce identical worker output).
+  // Loaded into a single ParseCache object that the pipeline mutates
+  // in-place (cache hits leave entries unchanged; misses add new ones).
+  const parseCache = await loadParseCache(storagePath);
+
   // ── Phase 1: Full Pipeline (0–60%) ────────────────────────────────
-  const pipelineResult = await runPipelineFromRepo(repoPath, (p) => {
-    const phaseLabel = PHASE_LABELS[p.phase] || p.phase;
-    const scaled = Math.round(p.percent * 0.6);
-    const message = p.detail ? `${p.message || phaseLabel} (${p.detail})` : p.message || phaseLabel;
-    progress(p.phase, scaled, message);
-  });
+  const pipelineResult = await runPipelineFromRepo(
+    repoPath,
+    (p) => {
+      const phaseLabel = PHASE_LABELS[p.phase] || p.phase;
+      const scaled = Math.round(p.percent * 0.6);
+      const message = p.detail ? `${p.message || phaseLabel} (${p.detail})` : p.message || phaseLabel;
+      progress(p.phase, scaled, message);
+    },
+    { parseCache },
+  );
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
   progress('lbug', 60, 'Loading into LadybugDB...');
@@ -634,6 +646,16 @@ export async function runFullAnalysis(
         | undefined,
     };
     await saveMeta(storagePath, meta);
+
+    // Persist the incremental parse cache for the next run. Wraps in
+    // try/catch so a cache-write failure never breaks an otherwise
+    // successful indexing run.
+    try {
+      await saveParseCache(storagePath, parseCache);
+    } catch (e) {
+      log(`Warning: could not save parse cache (${(e as Error).message}); continuing.`);
+    }
+
     // Forward the --name alias and the registry-collision bypass bit.
     // `allowDuplicateName` is its own concern — independent from the
     // pipeline `force` above. The CLI maps it from
