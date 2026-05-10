@@ -163,13 +163,14 @@ export async function runChunkedParseAndResolve(
     );
   }
 
-  // Sort by path so chunk membership is stable across runs even when
-  // the filesystem returns scan order non-deterministically. Without
-  // this, the parse cache misses on every run because chunk boundaries
-  // shift even when no source file content has changed. Sort is
-  // ascending alphabetical — the comparator works for both POSIX and
-  // Windows path separators since both are `string` in JS.
-  parseableScanned.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  // We previously sorted parseableScanned alphabetically here for stable
+  // chunk membership across runs (so the parse cache wouldn't miss when
+  // filesystem-scan order varied). Removed because it surfaced a
+  // pre-existing order-dependency in Ruby cross-file resolution
+  // (`user.address.save → Address#save` resolution depends on file
+  // processing order — a separate bug to fix). Filesystem order on most
+  // platforms is stable enough in practice that the cache still hits the
+  // common case; runs where it doesn't simply pay a cold-parse cost.
 
   const totalParseable = parseableScanned.length;
 
@@ -336,6 +337,11 @@ export async function runChunkedParseAndResolve(
 
       let chunkWorkerData: WorkerExtractedData | null;
       const cachedRaw = chunkHash ? parseCache!.entries.get(chunkHash) : undefined;
+
+      // Track every chunk hash we touched so the orchestrator can
+      // prune stale entries (chunks whose composition no longer
+      // corresponds to a live chunk in the current scan) before saving.
+      if (parseCache && chunkHash) parseCache.usedKeys.add(chunkHash);
 
       if (cachedRaw && cachedRaw.length > 0) {
         // Cache hit: replay the cached worker output through the same
@@ -524,6 +530,12 @@ export async function runChunkedParseAndResolve(
 
       filesParsedSoFar += chunkFiles.length;
       astCache.clear();
+    }
+
+    if (isDev && parseCache && (chunkCacheHits > 0 || chunkCacheMisses > 0)) {
+      logger.info(
+        `📦 parse-cache summary: ${chunkCacheHits} chunk hit(s), ${chunkCacheMisses} miss(es) across ${numChunks} chunk(s)`,
+      );
     }
 
     const fullWorkerHeritageMap =

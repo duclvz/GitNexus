@@ -43,6 +43,14 @@ interface ParseCacheFile {
 export interface ParseCache {
   version: number;
   entries: Map<string, ParseWorkerResult[]>;
+  /**
+   * Hashes referenced (hit OR miss-and-stored) by the current run.
+   * The parse phase populates this as it processes chunks; the orchestrator
+   * uses it as input to `pruneCache` before saving so entries that no
+   * longer correspond to any chunk in the current scan are discarded.
+   * Transient — never serialized to disk.
+   */
+  usedKeys: Set<string>;
 }
 
 /** SHA-256 hex of a single string or buffer. */
@@ -118,7 +126,7 @@ export const loadParseCache = async (storagePath: string): Promise<ParseCache> =
     for (const [k, v] of Object.entries(data.entries)) {
       if (Array.isArray(v)) entries.set(k, v as ParseWorkerResult[]);
     }
-    return { version: PARSE_CACHE_VERSION, entries };
+    return { version: PARSE_CACHE_VERSION, entries, usedKeys: new Set<string>() };
   } catch {
     return emptyCache();
   }
@@ -161,4 +169,5 @@ export const pruneCache = (cache: ParseCache, usedHashes: ReadonlySet<string>): 
 const emptyCache = (): ParseCache => ({
   version: PARSE_CACHE_VERSION,
   entries: new Map<string, ParseWorkerResult[]>(),
+  usedKeys: new Set<string>(),
 });

@@ -36,7 +36,7 @@ import {
 } from '../storage/repo-manager.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import { extractChangedSubgraph } from './incremental/subgraph-extract.js';
-import { loadParseCache, saveParseCache } from '../storage/parse-cache.js';
+import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
 import {
   getCurrentCommit,
   getRemoteUrl,
@@ -206,13 +206,38 @@ export async function runFullAnalysis(
       // may have uncommitted changes. Only short-circuit when the working
       // tree is also clean — otherwise fall through to the incremental
       // path which will hash-diff and update only changed files.
+      //
+      // We exclude paths that GitNexus itself writes during analyze:
+      //   .gitnexus/                  — db / parse cache / meta.json
+      //   .claude/, .cursor/          — auto-generated agent skill files
+      //   AGENTS.md, CLAUDE.md        — auto-updated stats blocks
+      // Counting them as dirty would perpetually defeat the up-to-date
+      // fast path because the previous analyze just wrote them
+      // (regression vs PR #1233 behavior).
       const dirty = (() => {
         try {
-          const out = execFileSync('git', ['status', '--porcelain'], {
-            cwd: repoPath,
-            stdio: ['ignore', 'pipe', 'ignore'],
-            encoding: 'utf8',
-          });
+          const out = execFileSync(
+            'git',
+            [
+              'status',
+              '--porcelain',
+              '--',
+              '.',
+              ':(exclude).gitnexus',
+              ':(exclude).gitnexus/**',
+              ':(exclude).claude',
+              ':(exclude).claude/**',
+              ':(exclude).cursor',
+              ':(exclude).cursor/**',
+              ':(exclude)AGENTS.md',
+              ':(exclude)CLAUDE.md',
+            ],
+            {
+              cwd: repoPath,
+              stdio: ['ignore', 'pipe', 'ignore'],
+              encoding: 'utf8',
+            },
+          );
           return out.trim().length > 0;
         } catch {
           return true; // conservative on git failure
@@ -281,18 +306,15 @@ export async function runFullAnalysis(
     );
   }
 
-  // Predict whether this run will use the incremental DB-writeback path.
-  // Used to suppress the embedding cache+restore cycle in the incremental
-  // case (embeddings stay in the DB; re-inserting them would PK-conflict).
-  const willTryIncremental =
-    !options.force &&
-    !!existingMeta &&
-    existingMeta.schemaVersion === INCREMENTAL_SCHEMA_VERSION &&
-    !!existingMeta.fileHashes &&
-    Object.keys(existingMeta.fileHashes).length > 0 &&
-    repoHasGit;
-
-  if (shouldLoadCache && existingMeta && !willTryIncremental) {
+  // We *always* load the embedding cache when one is requested (regardless
+  // of the predicted `willTryIncremental`). The post-pipeline branch may
+  // disagree with the prediction (e.g. when the pipeline produces zero
+  // File nodes, `isIncremental` flips false and the full-rebuild path
+  // wipes the DB) — loading unconditionally is cheap insurance against
+  // silently dropping embeddings on a mispredicted run. The re-insert
+  // step gates itself on the actual `isIncremental` value to avoid
+  // PK-conflicts when the incremental writeback path keeps the rows.
+  if (shouldLoadCache && existingMeta) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       await initLbug(lbugPath);
@@ -356,12 +378,18 @@ export async function runFullAnalysis(
   const newFileHashes = await computeFileHashes(repoPath, allFilePaths);
 
   // Decide incremental vs full at THIS point (post-pipeline, pre-DB).
-  // willTryIncremental was the *prediction* used to skip the embedding
-  // cache cycle; here we re-evaluate against the actual pipeline output.
+  // All eligibility conditions are checked here against the actual
+  // pipeline output — no separate pre-pipeline prediction to desync from
+  // (Bugbot review on PR #1479: a prediction that flipped post-pipeline
+  // could skip the embedding cache load and then take the full-rebuild
+  // path, silently losing embeddings).
   const isIncremental =
-    willTryIncremental &&
-    existingMeta !== null &&
+    !options.force &&
+    !!existingMeta &&
+    existingMeta.schemaVersion === INCREMENTAL_SCHEMA_VERSION &&
     !!existingMeta.fileHashes &&
+    Object.keys(existingMeta.fileHashes).length > 0 &&
+    repoHasGit &&
     allFilePaths.length > 0;
 
   const hashDiff = isIncremental
@@ -449,7 +477,12 @@ export async function runFullAnalysis(
     progress('fts', 90, 'Search indexes ready');
 
     // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
-    if (cachedEmbeddings.length > 0) {
+    // Skipped on the incremental path because that path keeps the
+    // existing DB rows in place (re-inserting cached vectors over
+    // surviving rows would PK-conflict). On the full-rebuild path,
+    // the DB was wiped, so re-inserting the cache is the mechanism
+    // that preserves embeddings across the rebuild.
+    if (cachedEmbeddings.length > 0 && !isIncremental) {
       const cachedDims = cachedEmbeddings[0].embedding.length;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
       if (cachedDims !== EMBEDDING_DIMS) {
@@ -642,8 +675,16 @@ export async function runFullAnalysis(
 
     // Persist the incremental parse cache for the next run. Wraps in
     // try/catch so a cache-write failure never breaks an otherwise
-    // successful indexing run.
+    // successful indexing run. Prune stale chunk-hash entries first so
+    // the cache file size stays bounded across runs (chunks whose
+    // composition no longer matches anything in the current scan are
+    // dead weight; the parse phase populates `usedKeys` as it processes
+    // chunks).
     try {
+      const pruned = pruneCache(parseCache, parseCache.usedKeys);
+      if (pruned > 0) {
+        log(`Parse cache: pruned ${pruned} stale chunk entries`);
+      }
       await saveParseCache(storagePath, parseCache);
     } catch (e) {
       log(`Warning: could not save parse cache (${(e as Error).message}); continuing.`);
