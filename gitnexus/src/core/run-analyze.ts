@@ -11,6 +11,7 @@
 
 import path from 'path';
 import fs from 'fs/promises';
+import { execFileSync } from 'child_process';
 import { runPipelineFromRepo } from './ingestion/pipeline.js';
 import {
   initLbug,
@@ -20,6 +21,8 @@ import {
   executeWithReusedStatement,
   closeLbug,
   loadCachedEmbeddings,
+  deleteNodesForFile,
+  deleteAllCommunitiesAndProcesses,
 } from './lbug/lbug-adapter.js';
 import { createSearchFTSIndexes } from './search/fts-indexes.js';
 import {
@@ -29,7 +32,10 @@ import {
   ensureGitNexusIgnored,
   registerRepo,
   cleanupOldKuzuFiles,
+  INCREMENTAL_SCHEMA_VERSION,
 } from '../storage/repo-manager.js';
+import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
+import { extractChangedSubgraph } from './incremental/subgraph-extract.js';
 import {
   getCurrentCommit,
   getRemoteUrl,
@@ -174,25 +180,58 @@ export async function runFullAnalysis(
 
   const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
-  const existingMeta = await loadMeta(storagePath);
+  let existingMeta = await loadMeta(storagePath);
+
+  // ── Crash recovery: dirty flag forces full rebuild ────────────────
+  // If the previous incremental run set incrementalInProgress and didn't
+  // clear it, the on-disk index may be in a half-state. Cheapest path
+  // back to a known-good index is to wipe + rebuild from scratch.
+  if (existingMeta?.incrementalInProgress) {
+    log(
+      'Previous incremental run did not complete cleanly (incrementalInProgress flag set); ' +
+        'forcing full rebuild to restore a known-good index.',
+    );
+    options = { ...options, force: true };
+    // Reload meta after clearing the flag in-memory; we still want fileHashes
+    // for the post-rebuild meta carry-over, but force=true ensures the
+    // rebuild path executes.
+  }
 
   // ── Early-return: already up to date ──────────────────────────────
   if (existingMeta && !options.force && existingMeta.lastCommit === currentCommit) {
     // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes
     if (currentCommit !== '') {
-      await ensureGitNexusIgnored(repoPath);
-      return {
-        // `resolveRepoIdentityRoot` collapses worktree roots to the
-        // canonical repo basename (#1259) but leaves arbitrary subdirs
-        // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
-        repoName:
-          options.registryName ??
-          getInferredRepoName(repoPath) ??
-          path.basename(resolveRepoIdentityRoot(repoPath)),
-        repoPath,
-        stats: existingMeta.stats ?? {},
-        alreadyUpToDate: true,
-      };
+      // For git repos, even if HEAD matches lastCommit, the working tree
+      // may have uncommitted changes. Only short-circuit when the working
+      // tree is also clean — otherwise fall through to the incremental
+      // path which will hash-diff and update only changed files.
+      const dirty = (() => {
+        try {
+          const out = execFileSync('git', ['status', '--porcelain'], {
+            cwd: repoPath,
+            stdio: ['ignore', 'pipe', 'ignore'],
+            encoding: 'utf8',
+          });
+          return out.trim().length > 0;
+        } catch {
+          return true; // conservative on git failure
+        }
+      })();
+      if (!dirty) {
+        await ensureGitNexusIgnored(repoPath);
+        return {
+          // `resolveRepoIdentityRoot` collapses worktree roots to the
+          // canonical repo basename (#1259) but leaves arbitrary subdirs
+          // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
+          repoName:
+            options.registryName ??
+            getInferredRepoName(repoPath) ??
+            path.basename(resolveRepoIdentityRoot(repoPath)),
+          repoPath,
+          stats: existingMeta.stats ?? {},
+          alreadyUpToDate: true,
+        };
+      }
     }
   }
 
@@ -241,7 +280,18 @@ export async function runFullAnalysis(
     );
   }
 
-  if (shouldLoadCache && existingMeta) {
+  // Predict whether this run will use the incremental DB-writeback path.
+  // Used to suppress the embedding cache+restore cycle in the incremental
+  // case (embeddings stay in the DB; re-inserting them would PK-conflict).
+  const willTryIncremental =
+    !options.force &&
+    !!existingMeta &&
+    existingMeta.schemaVersion === INCREMENTAL_SCHEMA_VERSION &&
+    !!existingMeta.fileHashes &&
+    Object.keys(existingMeta.fileHashes).length > 0 &&
+    repoHasGit;
+
+  if (shouldLoadCache && existingMeta && !willTryIncremental) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       await initLbug(lbugPath);
@@ -279,13 +329,59 @@ export async function runFullAnalysis(
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
   progress('lbug', 60, 'Loading into LadybugDB...');
 
-  await closeLbug();
-  const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];
-  for (const f of lbugFiles) {
-    try {
-      await fs.rm(f, { recursive: true, force: true });
-    } catch {
-      /* swallow */
+  // Compute current per-file content hashes from the pipeline's File nodes.
+  // Used both to drive the incremental DB writeback (when eligible) and to
+  // populate meta.json.fileHashes for the next run.
+  const allFilePaths: string[] = [];
+  pipelineResult.graph.forEachNode((n) => {
+    if (n.label === 'File') {
+      const fp = n.properties?.filePath as string | undefined;
+      if (fp) allFilePaths.push(fp);
+    }
+  });
+  const newFileHashes = await computeFileHashes(repoPath, allFilePaths);
+
+  // Decide incremental vs full at THIS point (post-pipeline, pre-DB).
+  // willTryIncremental was the *prediction* used to skip the embedding
+  // cache cycle; here we re-evaluate against the actual pipeline output.
+  const isIncremental =
+    willTryIncremental &&
+    existingMeta !== null &&
+    !!existingMeta.fileHashes &&
+    allFilePaths.length > 0;
+
+  const hashDiff = isIncremental
+    ? diffFileHashes(newFileHashes, existingMeta!.fileHashes)
+    : undefined;
+
+  if (isIncremental && hashDiff) {
+    log(
+      `Incremental: changed=${hashDiff.changed.length}, ` +
+        `added=${hashDiff.added.length}, ` +
+        `deleted=${hashDiff.deleted.length} ` +
+        `(skipping wipe + ${
+          allFilePaths.length - hashDiff.toWrite.length
+        } unchanged file rows preserved)`,
+    );
+    // Set the dirty flag BEFORE any destructive DB mutation. Cleared on
+    // success at the meta-save step.
+    await saveMeta(storagePath, {
+      ...existingMeta!,
+      incrementalInProgress: {
+        startedAt: Date.now(),
+        toWriteCount: hashDiff.toWrite.length,
+      },
+    });
+  } else {
+    // Full rebuild path: wipe DB files first.
+    await closeLbug();
+    const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];
+    for (const f of lbugFiles) {
+      try {
+        await fs.rm(f, { recursive: true, force: true });
+      } catch {
+        /* swallow */
+      }
     }
   }
 
@@ -296,11 +392,49 @@ export async function runFullAnalysis(
     // must be released to avoid blocking subsequent invocations.
 
     let lbugMsgCount = 0;
-    await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
-      lbugMsgCount++;
-      const pct = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
-      progress('lbug', pct, msg);
-    });
+    if (isIncremental && hashDiff) {
+      // ── Incremental DB writeback ───────────────────────────────────
+      // 1. Delete rows for files we're about to rewrite + deleted files.
+      const filesToDelete = [...hashDiff.toWrite, ...hashDiff.deleted];
+      for (let i = 0; i < filesToDelete.length; i++) {
+        const f = filesToDelete[i];
+        try {
+          await deleteNodesForFile(f);
+        } catch {
+          /* file may not have rows (e.g. an unparseable file) — fine */
+        }
+        if (i % 20 === 0) {
+          progress(
+            'lbug',
+            62,
+            `Removing rows for changed files (${i}/${filesToDelete.length})...`,
+          );
+        }
+      }
+      // 2. Drop graph-wide nodes (Community, Process). They'll be re-inserted
+      //    from the fresh pipeline output below. Required for the
+      //    "Leiden runs on the FULL graph" correctness invariant.
+      await deleteAllCommunitiesAndProcesses();
+
+      // 3. Extract the changed subgraph from the FULL ctx.graph and write
+      //    only that. Unchanged-file rows in the DB stay untouched.
+      const subgraph = extractChangedSubgraph(
+        pipelineResult.graph,
+        new Set(hashDiff.toWrite),
+      );
+      await loadGraphToLbug(subgraph, pipelineResult.repoPath, storagePath, (msg) => {
+        lbugMsgCount++;
+        const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
+        progress('lbug', pct, msg);
+      });
+    } else {
+      // ── Full rebuild ───────────────────────────────────────────────
+      await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
+        lbugMsgCount++;
+        const pct = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
+        progress('lbug', pct, msg);
+      });
+    }
 
     // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
     progress('fts', 85, 'Creating search indexes...');
@@ -454,6 +588,12 @@ export async function runFullAnalysis(
     const effectiveSemanticMode =
       semanticMode ??
       (runtimeCapabilities.semanticMode === 'vector-index' ? 'vector-index' : 'exact-scan');
+
+    // Convert the post-run file-hash map to the on-disk Record<string,string>
+    // shape consumed by RepoMeta.fileHashes.
+    const newFileHashesRecord: Record<string, string> = {};
+    for (const [k, v] of newFileHashes) newFileHashesRecord[k] = v;
+
     const meta = {
       repoPath,
       lastCommit: currentCommit,
@@ -483,6 +623,15 @@ export async function runFullAnalysis(
           reason: runtimeCapabilities.reason,
         },
       },
+      // Incremental-indexing fields. Populated for git repos so the next
+      // analyze run can take the incremental DB-writeback path. Setting
+      // incrementalInProgress to undefined explicitly clears any prior
+      // dirty flag (full and incremental success paths converge here).
+      schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
+      fileHashes: hasGitDir(repoPath) ? newFileHashesRecord : undefined,
+      incrementalInProgress: undefined as
+        | { startedAt: number; toWriteCount: number }
+        | undefined,
     };
     await saveMeta(storagePath, meta);
     // Forward the --name alias and the registry-collision bypass bit.

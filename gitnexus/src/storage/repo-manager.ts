@@ -71,7 +71,39 @@ export interface RepoMeta {
     processes?: number;
     embeddings?: number;
   };
+  /**
+   * Bumped whenever incremental-indexing invariants change in an
+   * incompatible way (delete-and-rewrite logic, subgraph extraction,
+   * graph-wide node handling). On mismatch, runFullAnalysis forces a
+   * full rebuild rather than risk an inconsistent incremental update.
+   */
+  schemaVersion?: number;
+  /**
+   * SHA-256 of every file's content at the time of the last successful
+   * indexing run. The next run computes current hashes and diffs against
+   * this map to determine which files' DB rows must be replaced.
+   * Map keys are repo-relative paths.
+   */
+  fileHashes?: Record<string, string>;
+  /**
+   * Crash-recovery dirty flag. Written to meta.json BEFORE any
+   * destructive DB mutation in an incremental run; cleared on success
+   * by overwriting meta.json. If a run crashes between, the next run
+   * sees the flag and forces a full rebuild — the cheapest path back
+   * to a known-good index.
+   */
+  incrementalInProgress?: {
+    /** When the incremental run started (epoch ms). */
+    startedAt: number;
+    /** Number of files in the writable set, for diagnostic logs. */
+    toWriteCount: number;
+  };
 }
+
+/**
+ * Bumped whenever incremental-indexing invariants change incompatibly.
+ */
+export const INCREMENTAL_SCHEMA_VERSION = 1;
 
 export interface IndexedRepo {
   repoPath: string;

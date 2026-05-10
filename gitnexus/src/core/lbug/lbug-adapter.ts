@@ -1204,6 +1204,37 @@ export const deleteNodesForFile = async (
 
 export const getEmbeddingTableName = (): string => EMBEDDING_TABLE_NAME;
 
+/**
+ * Drop every Community and Process node (and their MEMBER_OF /
+ * STEP_IN_PROCESS edges via DETACH DELETE). Used at the start of an
+ * incremental run so the communities and processes phases regenerate
+ * them from scratch on the merged graph — required for the
+ * "Leiden runs on the FULL graph" correctness invariant.
+ */
+export const deleteAllCommunitiesAndProcesses = async (): Promise<{
+  nodesDeleted: number;
+}> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  let nodesDeleted = 0;
+  for (const label of ['Community', 'Process']) {
+    try {
+      const countResult = await conn.query(`MATCH (n:${label}) RETURN count(n) AS cnt`);
+      const result = Array.isArray(countResult) ? countResult[0] : countResult;
+      const rows = await result.getAll();
+      const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
+      if (count > 0) {
+        await conn.query(`MATCH (n:${label}) DETACH DELETE n`);
+        nodesDeleted += count;
+      }
+    } catch {
+      // Table may not exist yet on a freshly-initialized DB — fine.
+    }
+  }
+  return { nodesDeleted };
+};
+
 // ============================================================================
 // Full-Text Search (FTS) Functions
 // ============================================================================
