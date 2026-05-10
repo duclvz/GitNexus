@@ -75,8 +75,21 @@ import { extractORMQueriesInline } from './orm-extraction.js';
 import { logger } from '../../logger.js';
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/** Max bytes of source content to load per parse chunk. */
-const CHUNK_BYTE_BUDGET = 20 * 1024 * 1024; // 20MB
+/** Max bytes of source content to load per parse chunk.
+ *
+ * Memory bound for the worker pool dispatch + a granularity knob for
+ * the parse cache. A single file change invalidates only its enclosing
+ * chunk, so smaller budgets → finer-grained invalidation.
+ *
+ * Override via GITNEXUS_CHUNK_BYTE_BUDGET (bytes) — the default of 2MB
+ * gives a useful invalidation floor (~1/N chunks on a multi-MB repo)
+ * while keeping worker dispatch overhead under 5% on cold runs.
+ */
+const CHUNK_BYTE_BUDGET = (() => {
+  const env = Number(process.env.GITNEXUS_CHUNK_BYTE_BUDGET);
+  if (Number.isFinite(env) && env > 0) return env;
+  return 2 * 1024 * 1024;
+})();
 
 // ── Main parse + resolve function ──────────────────────────────────────────
 
@@ -312,7 +325,7 @@ export async function runChunkedParseAndResolve(
         chunkWorkerData = mergeChunkResults(graph, symbolTable, cachedRaw);
         if (isDev) {
           logger.info(
-            `📦 parse-cache hit: chunk ${chunkIdx + 1}/${numChunks} (${chunkFiles.length} files, ${chunkHash!.slice(0, 8)})`,
+            `📦 parse-cache HIT: chunk ${chunkIdx + 1}/${numChunks} (${chunkFiles.length} files, ${chunkHash!.slice(0, 8)})`,
           );
         }
         // Progress update so UI advances even on a cache hit.
@@ -363,6 +376,11 @@ export async function runChunkedParseAndResolve(
         // small repos without worker pool simply don't cache. That's fine.
         if (parseCache && chunkHash && rawResults.length > 0) {
           parseCache.entries.set(chunkHash, rawResults);
+          if (isDev) {
+            logger.info(
+              `📦 parse-cache MISS+store: chunk ${chunkIdx + 1}/${numChunks} (${chunkFiles.length} files, ${chunkHash.slice(0, 8)})`,
+            );
+          }
         }
       }
 
