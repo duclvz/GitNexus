@@ -477,12 +477,20 @@ export async function runFullAnalysis(
     progress('fts', 90, 'Search indexes ready');
 
     // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
-    // Skipped on the incremental path because that path keeps the
-    // existing DB rows in place (re-inserting cached vectors over
-    // surviving rows would PK-conflict). On the full-rebuild path,
-    // the DB was wiped, so re-inserting the cache is the mechanism
-    // that preserves embeddings across the rebuild.
-    if (cachedEmbeddings.length > 0 && !isIncremental) {
+    // Runs on BOTH the full-rebuild path and the incremental path:
+    //   - Full rebuild: DB was wiped, every cached row needs to come back.
+    //   - Incremental:  changed-file rows were just deleted by
+    //                   deleteNodesForFile (which cascades to their
+    //                   embedding rows) — so their cached vectors need
+    //                   to come back too. Unchanged-file rows still
+    //                   exist; re-inserting their cached vectors would
+    //                   PK-conflict, but the per-batch try/catch below
+    //                   silently ignores those (matches the existing
+    //                   "some may fail if node was removed, that's
+    //                   fine" semantics). Bugbot review on PR #1479
+    //                   flagged that gating this on `!isIncremental`
+    //                   silently lost changed-file embeddings.
+    if (cachedEmbeddings.length > 0) {
       const cachedDims = cachedEmbeddings[0].embedding.length;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
       if (cachedDims !== EMBEDDING_DIMS) {
