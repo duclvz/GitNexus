@@ -71,47 +71,7 @@ export interface RepoMeta {
     processes?: number;
     embeddings?: number;
   };
-  /**
-   * Bumped whenever incremental-indexing invariants change in an
-   * incompatible way (schema bump, closure-algorithm fix, etc.).
-   * Mismatch → run-analyze forces a full rebuild.
-   * See docs/superpowers/specs/2026-05-10-incremental-indexing-design.md.
-   */
-  schemaVersion?: number;
-  /**
-   * Per-file content/surface signatures used to drive incremental closure
-   * expansion. v1: SHA-256 of file content (cheap, conservative — body-only
-   * edits trigger 1-hop closure expansion). v2 will switch to a real
-   * surface-only signature so body-only edits stay at closure size 1.
-   *
-   * Map keys are repo-relative file paths; values are hex digests. Files
-   * not in this map are treated as "no previous signature" → first-time
-   * processing.
-   */
-  surfaceSignatures?: Record<string, string>;
-  /**
-   * Crash-recovery dirty flag. Written by run-analyze BEFORE any DB
-   * mutation in an incremental run; cleared by overwrite on success. Its
-   * presence at the start of the next run forces a full rebuild — the
-   * cheapest path back to a known-good index after a crashed/cancelled
-   * incremental run. Consumed by run-analyze.ts.
-   */
-  incrementalInProgress?: {
-    closure: string[];
-    startedAt: number;
-  };
 }
-
-/**
- * Bumped whenever incremental-indexing invariants change in an
- * incompatible way. v1 is `1`. Increment when:
- *   - The closure-expansion algorithm changes in a way that prior
- *     surfaceSignatures cannot be trusted.
- *   - The hydrate phase's DB schema assumptions change.
- *   - The surface-signature derivation changes (so prior hashes are not
- *     comparable to current ones).
- */
-export const INCREMENTAL_SCHEMA_VERSION = 1;
 
 export interface IndexedRepo {
   repoPath: string;

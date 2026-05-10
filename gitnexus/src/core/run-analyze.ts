@@ -11,7 +11,6 @@
 
 import path from 'path';
 import fs from 'fs/promises';
-import { execFileSync } from 'child_process';
 import { runPipelineFromRepo } from './ingestion/pipeline.js';
 import {
   initLbug,
@@ -21,8 +20,6 @@ import {
   executeWithReusedStatement,
   closeLbug,
   loadCachedEmbeddings,
-  deleteNodesForFile,
-  deleteAllCommunitiesAndProcesses,
 } from './lbug/lbug-adapter.js';
 import { createSearchFTSIndexes } from './search/fts-indexes.js';
 import {
@@ -32,7 +29,6 @@ import {
   ensureGitNexusIgnored,
   registerRepo,
   cleanupOldKuzuFiles,
-  INCREMENTAL_SCHEMA_VERSION,
 } from '../storage/repo-manager.js';
 import {
   getCurrentCommit,
@@ -45,14 +41,6 @@ import type { CachedEmbedding } from './embeddings/types.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
 import { STALE_HASH_SENTINEL } from './lbug/schema.js';
-import {
-  isIncrementalEligible,
-  computeIncrementalClosure,
-  commitIncrementalProgress,
-  extractIncrementalSubgraph,
-  mergeSurfaceSignatures,
-  computeAllFileSignatures,
-} from './incremental/orchestrator.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -192,65 +180,20 @@ export async function runFullAnalysis(
   if (existingMeta && !options.force && existingMeta.lastCommit === currentCommit) {
     // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes
     if (currentCommit !== '') {
-      // For git repos, even if HEAD matches lastCommit, the working tree
-      // may have uncommitted changes. Only short-circuit when the working
-      // tree is also clean.
-      const dirty = hasDirtyTree(repoPath);
-      if (!dirty) {
-        await ensureGitNexusIgnored(repoPath);
-        return {
-          // `resolveRepoIdentityRoot` collapses worktree roots to the
-          // canonical repo basename (#1259) but leaves arbitrary subdirs
-          // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
-          repoName:
-            options.registryName ??
-            getInferredRepoName(repoPath) ??
-            path.basename(resolveRepoIdentityRoot(repoPath)),
-          repoPath,
-          stats: existingMeta.stats ?? {},
-          alreadyUpToDate: true,
-        };
-      }
-    }
-  }
-
-  // ── Incremental branch ─────────────────────────────────────────────
-  // Try the incremental path first. Falls through to full rebuild on:
-  //   - --force
-  //   - missing/old meta.json
-  //   - lastCommit gone (rebased)
-  //   - schemaVersion mismatch
-  //   - non-git repo
-  //   - any error during incremental setup
-  const eligibility = isIncrementalEligible(repoPath, existingMeta, options.force);
-  if (eligibility.eligible && existingMeta) {
-    try {
-      const result = await runIncrementalBranch(
+      await ensureGitNexusIgnored(repoPath);
+      return {
+        // `resolveRepoIdentityRoot` collapses worktree roots to the
+        // canonical repo basename (#1259) but leaves arbitrary subdirs
+        // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
+        repoName:
+          options.registryName ??
+          getInferredRepoName(repoPath) ??
+          path.basename(resolveRepoIdentityRoot(repoPath)),
         repoPath,
-        storagePath,
-        lbugPath,
-        existingMeta,
-        currentCommit,
-        options,
-        callbacks,
-      );
-      if (result) return result;
-      // result === null → falls through to full rebuild (e.g. setup failed)
-    } catch (err) {
-      log(
-        `Incremental run failed (${(err as Error).message}); ` +
-          `next run will full-rebuild via dirty-flag.`,
-      );
-      // Re-throw — the dirty flag is set; next run forces full rebuild.
-      try {
-        await closeLbug();
-      } catch {
-        /* swallow */
-      }
-      throw err;
+        stats: existingMeta.stats ?? {},
+        alreadyUpToDate: true,
+      };
     }
-  } else if (existingMeta) {
-    log(`Incremental skipped: ${eligibility.reason ?? 'unknown reason'}`);
   }
 
   // ── Cache embeddings from existing index before rebuild ────────────
@@ -511,32 +454,6 @@ export async function runFullAnalysis(
     const effectiveSemanticMode =
       semanticMode ??
       (runtimeCapabilities.semanticMode === 'vector-index' ? 'vector-index' : 'exact-scan');
-
-    // Compute per-file surface signatures so the next run can be incremental.
-    // v1 uses content-hash (cheap, conservative). v2 will switch to a
-    // surface-only signature so body-only edits don't expand the closure.
-    let surfaceSignatures: Record<string, string> | undefined;
-    if (hasGitDir(repoPath)) {
-      try {
-        const allFilePaths: string[] = [];
-        pipelineResult.graph.forEachNode((n) => {
-          const fp = n.properties?.filePath as string | undefined;
-          if (fp && (n.label === 'File' || n.label === 'Folder')) {
-            // File nodes carry their own path; we want every distinct repo-relative
-            // file path that participated in indexing. Use File nodes as the
-            // authoritative source.
-            if (n.label === 'File') allFilePaths.push(fp);
-          }
-        });
-        if (allFilePaths.length > 0) {
-          surfaceSignatures = await computeAllFileSignatures(repoPath, allFilePaths);
-        }
-      } catch {
-        /* surface signatures are best-effort; their absence just means the
-         * next run will fall back to full rebuild. */
-      }
-    }
-
     const meta = {
       repoPath,
       lastCommit: currentCommit,
@@ -548,14 +465,6 @@ export async function runFullAnalysis(
       // origin remote, which is fine: paths-only repos behave as
       // before.
       remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
-      // Incremental-indexing fields — populated for git repos only. The
-      // next analyze run reads these to decide whether to take the
-      // incremental path. See the Incremental branch above.
-      schemaVersion: surfaceSignatures ? INCREMENTAL_SCHEMA_VERSION : undefined,
-      surfaceSignatures,
-      incrementalInProgress: undefined as
-        | { closure: string[]; startedAt: number }
-        | undefined,
       stats: {
         files: pipelineResult.totalFileCount,
         nodes: stats.nodes,
@@ -644,243 +553,4 @@ export async function runFullAnalysis(
     }
     throw err;
   }
-}
-
-// ===========================================================================
-// Incremental analysis branch — invoked from runFullAnalysis when eligible.
-// See docs/superpowers/specs/2026-05-10-incremental-indexing-design.md.
-// ===========================================================================
-
-/**
- * Cheap check: does the working tree have uncommitted changes? Used to
- * decide whether the "lastCommit == HEAD" early-exit is safe to take.
- */
-function hasDirtyTree(repoPath: string): boolean {
-  try {
-    const out = execFileSync('git', ['status', '--porcelain'], {
-      cwd: repoPath,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      encoding: 'utf8',
-    });
-    return out.trim().length > 0;
-  } catch {
-    // If git status fails for any reason, conservatively assume dirty so
-    // we don't accidentally short-circuit a real change.
-    return true;
-  }
-}
-
-/**
- * Execute the incremental branch of `runFullAnalysis`. Returns null when
- * setup determines a full rebuild is needed instead (caller falls through).
- *
- * Throws if the run fails after the dirty flag is set — caller is
- * responsible for surfacing the error; the next run will detect the dirty
- * flag and force a full rebuild.
- */
-async function runIncrementalBranch(
-  repoPath: string,
-  storagePath: string,
-  lbugPath: string,
-  existingMeta: import('../storage/repo-manager.js').RepoMeta,
-  currentCommit: string,
-  options: AnalyzeOptions,
-  callbacks: AnalyzeCallbacks,
-): Promise<AnalyzeResult | null> {
-  const log = (msg: string) => callbacks.onLog?.(msg);
-  const progress = (phase: string, percent: number, message: string) =>
-    callbacks.onProgress(phase, percent, message);
-
-  log(
-    `Incremental: probing for changes since ${existingMeta.lastCommit.slice(0, 7)}...`,
-  );
-
-  // 1. Compute closure (parses each file's content hash, walks DB importers).
-  let setup: Awaited<ReturnType<typeof computeIncrementalClosure>>;
-  try {
-    // Open the existing DB so closure expansion can query the IMPORTS edges.
-    await initLbug(lbugPath);
-    setup = await computeIncrementalClosure(
-      repoPath,
-      existingMeta.lastCommit,
-      existingMeta.surfaceSignatures ?? {},
-    );
-  } catch (e) {
-    try {
-      await closeLbug();
-    } catch {
-      /* swallow */
-    }
-    log(
-      `Incremental setup failed: ${(e as Error).message}. Falling back to full rebuild.`,
-    );
-    return null;
-  }
-
-  // 2. No changes? Update lastCommit and return early.
-  if (setup.closure.size === 0 && setup.deletedFiles.length === 0) {
-    log('Incremental: no file changes detected — refreshing meta only.');
-    try {
-      await closeLbug();
-    } catch {
-      /* swallow */
-    }
-    const meta: import('../storage/repo-manager.js').RepoMeta = {
-      ...existingMeta,
-      lastCommit: currentCommit,
-      indexedAt: new Date().toISOString(),
-    };
-    await saveMeta(storagePath, meta);
-    await ensureGitNexusIgnored(repoPath);
-    return {
-      repoName:
-        options.registryName ??
-        getInferredRepoName(repoPath) ??
-        path.basename(resolveRepoIdentityRoot(repoPath)),
-      repoPath,
-      stats: existingMeta.stats ?? {},
-      alreadyUpToDate: true,
-    };
-  }
-
-  log(
-    `Incremental: closure=${setup.closure.size} (changed=${setup.changes.modified.length} ` +
-      `+ added=${setup.changes.added.length} + importers=${setup.closure.size - setup.changes.modified.length - setup.changes.added.length}), ` +
-      `deleted=${setup.deletedFiles.length}`,
-  );
-
-  // 3. Mark dirty BEFORE any DB mutation. Closes lbug temporarily to
-  //    release the connection while saveMeta writes.
-  await commitIncrementalProgress(storagePath, existingMeta, setup.closure);
-
-  // 4. Delete stale rows from the DB.
-  progress('lbug', 5, 'Removing stale rows for changed files...');
-  for (const file of setup.closure) {
-    try {
-      await deleteNodesForFile(file);
-    } catch {
-      /* file may not have been indexed yet — fine */
-    }
-  }
-  for (const file of setup.deletedFiles) {
-    try {
-      await deleteNodesForFile(file);
-    } catch {
-      /* fine */
-    }
-  }
-  // Always wipe Community / Process — they're regenerated by downstream
-  // pipeline phases and must come from the merged graph for correctness
-  // (Leiden runs on the FULL hydrated + parsed graph).
-  await deleteAllCommunitiesAndProcesses();
-
-  // 5. Run the pipeline with filesToParse set so:
-  //    - hydrate phase fills ctx.graph with unchanged-file nodes from DB
-  //    - parse phase only parses closure files
-  //    - downstream phases (mro, communities, processes) see the full graph
-  const pipelineResult = await runPipelineFromRepo(
-    repoPath,
-    (p) => {
-      const phaseLabel = PHASE_LABELS[p.phase] || p.phase;
-      const scaled = 10 + Math.round(p.percent * 0.55); // 10–65%
-      const message = p.detail ? `${p.message || phaseLabel} (${p.detail})` : p.message || phaseLabel;
-      progress(p.phase, scaled, message);
-    },
-    { filesToParse: setup.closure },
-  );
-
-  // 6. Extract the subgraph that needs to be written: closure-file nodes
-  //    + graph-wide nodes + edges incident to them. Hydrated unchanged-file
-  //    nodes are NOT in this subgraph — their rows are still in DB.
-  progress('lbug', 70, 'Writing incremental updates to LadybugDB...');
-  const subgraph = extractIncrementalSubgraph(pipelineResult.graph, setup.closure);
-  await loadGraphToLbug(subgraph, repoPath, storagePath, (msg) => {
-    progress('lbug', 80, msg);
-  });
-
-  // 7. Recreate FTS indexes (cheap; full rebuild over the merged DB state).
-  progress('fts', 90, 'Refreshing search indexes...');
-  try {
-    await createSearchFTSIndexes();
-  } catch {
-    /* FTS is best-effort; log only */
-  }
-
-  // 8. Compute final stats from the live DB state.
-  const stats = await getLbugStats();
-
-  // 9. Compute new meta (merge surface signatures, clear dirty flag).
-  const mergedSurfaces = mergeSurfaceSignatures(
-    existingMeta.surfaceSignatures ?? {},
-    setup.newFileHashes,
-    setup.deletedFiles,
-  );
-
-  const newMeta: import('../storage/repo-manager.js').RepoMeta = {
-    ...existingMeta,
-    lastCommit: currentCommit,
-    indexedAt: new Date().toISOString(),
-    remoteUrl: getRemoteUrl(repoPath) ?? existingMeta.remoteUrl,
-    schemaVersion: INCREMENTAL_SCHEMA_VERSION,
-    surfaceSignatures: mergedSurfaces,
-    incrementalInProgress: undefined, // explicit clear
-    stats: {
-      ...(existingMeta.stats ?? {}),
-      files: pipelineResult.totalFileCount,
-      nodes: stats.nodes,
-      edges: stats.edges,
-      communities: pipelineResult.communityResult?.stats.totalCommunities,
-      processes: pipelineResult.processResult?.stats.totalProcesses,
-    },
-  };
-
-  // 10. Persist meta + register repo.
-  await saveMeta(storagePath, newMeta);
-  const projectName = await registerRepo(repoPath, newMeta, {
-    name: options.registryName,
-    allowDuplicateName: options.allowDuplicateName,
-  });
-
-  // 11. Best-effort AI-context regeneration so AGENTS.md/CLAUDE.md stay
-  //     in sync with the post-incremental graph state.
-  let aggregatedClusterCount = 0;
-  if (pipelineResult.communityResult?.communities) {
-    const groups = new Map<string, number>();
-    for (const c of pipelineResult.communityResult.communities) {
-      const label = c.heuristicLabel || c.label || 'Unknown';
-      groups.set(label, (groups.get(label) || 0) + c.symbolCount);
-    }
-    aggregatedClusterCount = Array.from(groups.values()).filter((cnt) => cnt >= 5).length;
-  }
-  try {
-    await generateAIContextFiles(
-      repoPath,
-      storagePath,
-      projectName,
-      {
-        files: pipelineResult.totalFileCount,
-        nodes: stats.nodes,
-        edges: stats.edges,
-        communities: pipelineResult.communityResult?.stats.totalCommunities,
-        clusters: aggregatedClusterCount,
-        processes: pipelineResult.processResult?.stats.totalProcesses,
-      },
-      undefined,
-      { skipAgentsMd: options.skipAgentsMd, noStats: options.noStats },
-    );
-  } catch {
-    /* best-effort */
-  }
-
-  await ensureGitNexusIgnored(repoPath);
-  await closeLbug();
-
-  progress('done', 100, 'Incremental complete');
-
-  return {
-    repoName: projectName,
-    repoPath,
-    stats: newMeta.stats ?? {},
-    pipelineResult,
-  };
 }

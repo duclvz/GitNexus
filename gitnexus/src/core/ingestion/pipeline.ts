@@ -23,7 +23,6 @@ import {
   getPhaseOutput,
   scanPhase,
   structurePhase,
-  hydratePhase,
   markdownPhase,
   cobolPhase,
   parsePhase,
@@ -56,18 +55,6 @@ export interface PipelineOptions {
     minFiles?: number;
     minBytes?: number;
   };
-  /**
-   * Incremental-indexing mode: when set, the parse phase only re-parses
-   * files in this set, and the new `hydrate` phase pre-loads node/edge
-   * state for everything else from the existing LadybugDB index.
-   *
-   * Unset (the default) → full-rebuild mode: parse phase processes every
-   * scanned file and hydrate is a no-op. Set by `runFullAnalysis` when it
-   * detects an eligible incremental run; never set by callers directly.
-   *
-   * See `docs/superpowers/specs/2026-05-10-incremental-indexing-design.md`.
-   */
-  filesToParse?: ReadonlySet<string>;
 }
 
 // ── Phase registry ─────────────────────────────────────────────────────────
@@ -87,7 +74,6 @@ function buildPhaseList(options?: PipelineOptions): PipelinePhase[] {
   const phases: PipelinePhase[] = [
     scanPhase,
     structurePhase,
-    hydratePhase,
     markdownPhase,
     cobolPhase,
     parsePhase,
