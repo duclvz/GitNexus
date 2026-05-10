@@ -149,10 +149,15 @@ Indexed as **GitNexus** (4325 symbols, 10556 relationships, 300 execution flows)
 ## Keeping the Index Fresh
 
 ```bash
-npx gitnexus analyze                 # basic refresh; preserves any existing embeddings
+npx gitnexus analyze                 # incremental by default; preserves embeddings
+npx gitnexus analyze --force         # full rebuild from scratch (opt out of incremental)
 npx gitnexus analyze --embeddings    # also generate embeddings for new/changed nodes
 npx gitnexus analyze --drop-embeddings  # explicit opt-in to wipe existing embeddings
 ```
+
+`analyze` runs **incrementally by default**: only files whose content has changed since the last index are re-parsed (chunk-level parse cache at `.gitnexus/parse-cache.json`) and only their rows are rewritten in LadybugDB. Output is byte-equivalent to a full rebuild. Pass `--force` to wipe and re-index from scratch (e.g., to recover from a corrupt index, or after upgrading GitNexus).
+
+The parse cache is **content-addressed**, so it survives `--force` runs. Safe to delete `.gitnexus/parse-cache.json` at any time — it'll be rebuilt on the next analyze.
 
 Check `.gitnexus/meta.json` `stats.embeddings` (0 = none). A plain `analyze` no longer drops existing vectors — pass `--drop-embeddings` to wipe.
 

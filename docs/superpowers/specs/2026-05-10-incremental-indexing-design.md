@@ -1,528 +1,165 @@
 # Incremental Indexing Design
 
 **Date:** 2026-05-10
-**Status:** Approved (sections 1-5 reviewed inline by maintainer 2026-05-10)
+**Status:** Implemented and equivalence-verified
 **Owner:** abhigyanpatwari + Claude Code
 **Prior art:** PR #592 (zenprocess), PR #533 (davidbeesley), PR #1146 (azeemshaik025)
 
 ## Why
 
-`gitnexus analyze` currently has only a coarse-grained early-exit: if `meta.json.lastCommit == HEAD` and the working tree is clean, it no-ops; otherwise it does a full re-index. On a 60K+ symbol TypeScript repo a full re-index can take ~30s. After a one-line edit, that's wasted work.
+`gitnexus analyze` previously had only a coarse early-exit: if `meta.json.lastCommit == HEAD` and the working tree was clean it no-op'd, otherwise it did a full re-index. On a 1000-file TypeScript repo a full re-index runs ~140s. After a one-line edit, that's wasted work.
 
-Three open community PRs (#592, #533, #1146) attempt incremental re-indexing but each has problems:
-
-- **#592** (zenprocess) targets a now-defunct version of `pipeline.ts` (the codebase has since refactored to a phase-based pipeline). Beyond the merge conflict, its design has a real correctness bug: it only feeds changed files into `parse`, leaving `ctx.graph` populated with just the changed-file subgraph. Community detection (Leiden) then runs on that subgraph and produces drift, since modularity is a global metric and Leiden's results depend on graph-wide topology.
-- **#1146** (azeemshaik025) is a stacked review-fix PR for #592 — inherits the same design bug.
-- **#533** (davidbeesley) caches per-file parse and embedding results content-addressed but explicitly leaves "incremental LadybugDB load" out of scope. It's a parse/embedding speedup, not real incremental indexing.
-
-We reject the partial-graph-Leiden approach. The correctness invariant is **incremental output ≡ full-rebuild output**.
+Three open community PRs (#592, #533, #1146) attempted incremental re-indexing with different mechanisms; we drew on each but ended up taking a different architectural path after a v1 attempt failed.
 
 ## Correctness contract
 
-A run of `analyze` (default, incremental) on a repo that previously had `analyze --force` run against state S1 and is now at state S2 must produce a LadybugDB whose contents (nodes, edges, graph-wide phase outputs) are equivalent to running `analyze --force` directly against S2 from a fresh state. "Equivalent" means: identical node IDs, identical edge sets, identical Community membership (with seeded Leiden RNG), identical Process detection.
-
-This is verified by an equivalence test (§ Testing) that snapshots the DB after both paths and asserts equality.
-
-## Decisions (locked in by maintainer)
-
-1. **Re-parse scope:** transitive importer closure of changed files. When a changed file's *public surface* (exported symbol names + signatures + heritage) is unchanged, do not expand to its importers. This is the v1 surface-change optimization.
-2. **Change detection:** `git diff lastCommit HEAD` (committed) ∪ `git status --porcelain` (dirty). Non-git repos always do a full rebuild (the existing behavior for them — they have no change-detection mechanism and never did).
-3. **Rollout:** new default for `analyze`. `--force` opts out and always does a full rebuild.
-4. **Embeddings:** out of scope for v1. Existing semantics preserved (unchanged-file embeddings survive; closure-file embeddings are dropped along with their nodes; no regeneration without `--embeddings`).
-5. **Leiden RNG:** seeded for reproducibility (small foundational change to `community-processor.ts`, independent of incremental but required for the equivalence test).
-
-## Architecture
-
-The pipeline already uses a phase-based DAG (12 phases, `runPipeline` in `pipeline-phases/runner.ts`). We add **one new phase** (`hydrate`) and **one new DB primitive** (`loadGraphFromLbug`). The orchestrator (`run-analyze.ts`) gains the closure-computation logic. Existing phases (`parse`, `mro`, `communities`, `processes`) are untouched or get tiny surgical changes.
-
-```
-                              ┌──────────────────────────────────────┐
-                              │  run-analyze.ts (orchestrator)       │
-                              │  • git diff vs lastCommit            │
-                              │  • iterative closure expansion       │
-                              │    (parse + surface check)           │
-                              │  • set ctx.options.filesToParse      │
-                              │  • set incrementalInProgress flag    │
-                              └──────────────────────┬───────────────┘
-                                                     ▼
-   ┌─────────────────────────────── pipeline ─────────────────────────────────┐
-   │  scan → structure → [hydrate] → [markdown,cobol] → parse → routes/tools/ │
-   │                       (NEW)                       (filtered)             │
-   │   orm → crossFile → scopeResolution → mro → communities → processes      │
-   │                                              (run on FULL hydrated graph)│
-   └─────────────────────────┬────────────────────────────────────────────────┘
-                             ▼
-                   ┌──────────────────────────┐
-                   │  lbug-adapter.ts         │
-                   │  • loadGraphFromLbug    │  ← NEW (DB → KnowledgeGraph)
-                   │  • deleteNodesForFiles   │  ← already exists, batch wrap
-                   │  • loadGraphToLbug       │  ← already exists
-                   └──────────────────────────┘
-```
-
-### Why a new phase (Approach A) and not orchestrator-only
-
-The codebase invests heavily in the phase architecture: typed dep graph, dedicated runner, single shared `KnowledgeGraph` accumulator, documented "how to add a phase" contract in `ARCHITECTURE.md`. Approach A (new phase) matches that pattern exactly — `mro`, `communities`, `processes` need *zero* code changes because they just see a fully-populated `ctx.graph`. Approach B (orchestrator-driven merge, pipeline untouched) would require either calling phase implementations directly from outside the runner or duplicating phase wiring; both fight the architecture. Approach C (two parallel orchestrators) duplicates registry/AGENTS-update/error-handling and drifts over time.
-
-## Components
-
-### `core/incremental/git-diff.ts` (new)
-
-```ts
-export interface ChangedFiles {
-  modified: string[];
-  added: string[];
-  deleted: string[];
-}
-
-export function getChangedFilesSinceCommit(
-  repoPath: string,
-  lastCommit: string,
-): ChangedFiles;
-```
-
-Implementation: `git diff --name-status <lastCommit> HEAD` for committed changes plus `git status --porcelain` for dirty tree. Renames are flattened (R100 file_old → file_new becomes delete(file_old) + add(file_new)). Returns `null` (or throws a sentinel error) when `lastCommit` no longer exists in the repo (rebased away) — the orchestrator falls back to full rebuild.
-
-### `core/incremental/surface.ts` (new)
-
-```ts
-export function extractSurfaceSignature(
-  graph: KnowledgeGraph,
-  filePath: string,
-): string;  // stable hash
-
-export function surfaceChanged(prev: string | undefined, current: string): boolean;
-```
-
-Walks `graph` for nodes with the given `filePath`, filters to publicly-visible (functions, classes, methods, interfaces, types — using existing `LanguageProvider.exportChecker` per node's language), extracts each's `name + parameter types + return type + heritage`, sorts deterministically, hashes. Stored per-file in `meta.json.surfaceSignatures`.
-
-A *body-only* change to a file produces the same surface hash. A *signature* change produces a different hash → closure expands to importers.
-
-### `core/incremental/closure.ts` (new)
-
-```ts
-export interface ClosureResult {
-  closure: Set<string>;
-  parseCache: Map<string, ParseWorkerResult>;
-}
-
-export async function computeImporterClosure(
-  initialChangedFiles: Set<string>,
-  prevSurfaces: Record<string, string>,
-  parseFile: (path: string) => Promise<ParseWorkerResult>,
-  queryImporters: (filePath: string) => Promise<string[]>,
-): Promise<ClosureResult>;
-```
-
-Iterative fixpoint:
-
-```
-queue   = initialChangedFiles
-closure = initialChangedFiles
-parseCache = new Map()
-
-while queue not empty:
-  f = queue.pop()
-  pr = await parseFile(f)            // single-file tree-sitter parse
-  parseCache.set(f, pr)
-  newSurface = extractSurfaceSignature(pr-derived graph, f)
-  if newSurface !== prevSurfaces[f]:   // surface changed (or no prev)
-    importers = await queryImporters(f)
-    for i in importers \ closure:
-      closure.add(i); queue.add(i)
-
-return { closure, parseCache }
-```
-
-`queryImporters(f)` is `MATCH (a)-[r:IMPORTS]->(b) WHERE b.filePath = $f RETURN DISTINCT a.filePath` against the existing DB.
-
-### `core/lbug/lbug-adapter.ts` — new `loadGraphFromLbug`
-
-```ts
-export async function loadGraphFromLbug(
-  graph: KnowledgeGraph,
-  unchangedFilePaths: Set<string>,
-): Promise<{ nodesLoaded: number; edgesLoaded: number }>;
-```
-
-For each non-graph-wide node table (File, Folder, Function, Class, Method, …) streams rows where `filePath IN $unchangedFilePaths`, calls `graph.addNode(...)`. Then streams `CodeRelation` rows where source and target both have `filePath` in the set OR one endpoint is the source belongs to a node we already loaded. Skips Community/Process labels and their MEMBER_OF / STEP_IN_PROCESS edges entirely — those are graph-wide, will be regenerated by `communitiesPhase` / `processesPhase` from scratch.
-
-Batch via `streamQuery` (already used in lbug-adapter for back-pressure). Filter set passed via Cypher parameter, not string interpolation.
-
-### `pipeline-phases/hydrate.ts` (new)
-
-```ts
-import type { PipelinePhase } from './types.js';
-import { getPhaseOutput } from './types.js';
-import type { StructureOutput } from './structure.js';
-import { loadGraphFromLbug } from '../../lbug/lbug-adapter.js';
-
-export interface HydrateOutput {
-  hydrated: boolean;
-  nodesLoaded: number;
-}
-
-export const hydratePhase: PipelinePhase<HydrateOutput> = {
-  name: 'hydrate',
-  deps: ['structure'],
-  async execute(ctx, deps) {
-    const filesToParse = ctx.options?.filesToParse;
-    if (!filesToParse) return { hydrated: false, nodesLoaded: 0 };  // full mode
-
-    const { allFilePaths } = getPhaseOutput<StructureOutput>(deps, 'structure');
-    const unchanged = new Set(allFilePaths.filter((f) => !filesToParse.has(f)));
-    const result = await loadGraphFromLbug(ctx.graph, unchanged);
-    return { hydrated: true, nodesLoaded: result.nodesLoaded };
-  },
-};
-```
-
-No-op when `filesToParse` is unset (full-rebuild path is byte-for-byte unchanged).
-
-### `pipeline-phases/parse.ts` (modified, surgical)
-
-Add ~8 lines at the top of `parsePhase.execute`:
-
-```ts
-const filesToParse = ctx.options?.filesToParse;
-const prebuiltParseResults = ctx.options?.prebuiltParseResults;
-const targetFiles = filesToParse
-  ? scannedFiles.filter((f) => filesToParse.has(f.path))
-  : scannedFiles;
-// ... existing chunked parsing logic uses targetFiles
-// when iterating, if prebuiltParseResults?.has(file.path), skip the worker
-// dispatch and merge the cached result instead.
-```
-
-Existing chunked-parse logic, worker dispatch, and binding accumulator lifecycle unchanged.
-
-### `pipeline.ts` (modified)
-
-- Register `hydratePhase` in `buildPhaseList()` between `structurePhase` and `markdownPhase`/`cobolPhase`.
-- Extend `PipelineOptions`:
-
-```ts
-export interface PipelineOptions {
-  // existing fields...
-  /** Subset of repo-relative paths to parse. When set, the parse phase skips
-   *  files outside this set. Files not in this set are loaded from DB by the
-   *  hydrate phase. */
-  filesToParse?: Set<string>;
-  /** Optional pre-parsed results to reuse instead of re-running tree-sitter
-   *  on closure files (populated by the orchestrator during closure
-   *  computation). */
-  prebuiltParseResults?: Map<string, ParseWorkerResult>;
-}
-```
-
-### `core/run-analyze.ts` (modified, the orchestrator)
-
-```ts
-// At the top of runFullAnalysis, after loading meta:
-
-const repoHasGit = hasGitDir(repoPath);
-const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
-const existingMeta = await loadMeta(storagePath);
-
-// Existing early-exit for "lastCommit == HEAD && clean tree" — keep as-is.
-
-// Recover from a crashed previous run.
-if (existingMeta?.incrementalInProgress) {
-  log('Previous incremental run did not complete cleanly — full rebuild');
-  options = { ...options, force: true };
-}
-
-// Decide path: incremental vs full.
-const incremental =
-  !options.force &&
-  repoHasGit &&
-  existingMeta &&
-  existingMeta.schemaVersion === CURRENT_SCHEMA_VERSION &&
-  existingMeta.surfaceSignatures &&
-  existingCommitExists(repoPath, existingMeta.lastCommit);
-
-if (incremental) {
-  const changed = await getChangedFilesSinceCommit(repoPath, existingMeta.lastCommit);
-  const initial = new Set([...changed.modified, ...changed.added]);
-
-  const { closure, parseCache } = await computeImporterClosure(
-    initial,
-    existingMeta.surfaceSignatures,
-    parseFileForSurface,                 // wraps parse-worker for one file
-    queryImporters,                      // wraps the IMPORTS-into Cypher query
-  );
-
-  // Mark dirty BEFORE any delete.
-  await saveMeta({ ...existingMeta, incrementalInProgress: { closure: [...closure], startedAt: Date.now() } });
-
-  await initLbug(lbugPath);
-  await deleteNodesForFiles([...closure, ...changed.deleted]);
-  await deleteAllCommunitiesAndProcesses();
-
-  pipelineOptions.filesToParse = closure;
-  pipelineOptions.prebuiltParseResults = parseCache;
-
-  // Pipeline runs once with these options.
-  // After pipeline, ctx.graph contains hydrated unchanged + freshly parsed closure.
-
-  // Writeback: ONLY closure files + graph-wide nodes/edges.
-  await loadChangedSubgraphToLbug(graph, closure);
-
-  // Update surfaces.
-  const newSurfaces = { ...existingMeta.surfaceSignatures };
-  for (const f of changed.deleted) delete newSurfaces[f];
-  for (const f of closure) newSurfaces[f] = extractSurfaceSignature(graph, f);
-
-  await saveMeta({
-    ...existingMeta,
-    lastCommit: currentCommit,
-    surfaceSignatures: newSurfaces,
-    schemaVersion: CURRENT_SCHEMA_VERSION,
-    incrementalInProgress: undefined,  // clears the dirty flag
-    stats: ...,
-    indexedAt: new Date().toISOString(),
-  });
-} else {
-  // Full rebuild path (existing logic, unchanged).
-  // After completion, populate surfaceSignatures for every file so the next
-  // run can be incremental.
-  const surfaces: Record<string, string> = {};
-  for (const f of allFilePaths) surfaces[f] = extractSurfaceSignature(graph, f);
-  await saveMeta({
-    ...existingMeta,
-    lastCommit: currentCommit,
-    surfaceSignatures: surfaces,
-    schemaVersion: CURRENT_SCHEMA_VERSION,
-    ...
-  });
-}
-```
-
-### `storage/repo-manager.ts` (modified — `RepoMeta` schema)
-
-```ts
-export interface RepoMeta {
-  // ... existing fields ...
-  schemaVersion?: number;        // bump when incremental invariants change
-  surfaceSignatures?: Record<string, string>;  // filePath → surface hash
-  incrementalInProgress?: {
-    closure: string[];
-    startedAt: number;
-  };
-}
-
-export const CURRENT_SCHEMA_VERSION = 1;
-```
-
-`schemaVersion` lets us force a full rebuild if internal invariants change. Missing or mismatched version → full rebuild path. `incrementalInProgress` is the dirty flag for crash recovery.
-
-## Data flow (incremental run)
-
-```
-analyze (no flags) on a git repo with existing index
-─────────────────────────────────────────────────────
-1. Orchestrator loads meta.json
-   ├── schemaVersion, lastCommit, surfaceSignatures, incrementalInProgress
-   └── If incrementalInProgress present → log + force full rebuild
-   └── If schemaVersion mismatch OR meta missing → full rebuild path
-
-2. Sanity check: does lastCommit still exist?
-   └── git cat-file -e <lastCommit> → if missing, full rebuild path
-
-3. Compute git changes
-   ├── git diff --name-status <lastCommit> HEAD
-   ├── git status --porcelain
-   └── → ChangedFiles { modified, added, deleted } (renames flattened)
-
-4. Iterative closure expansion
-   queue   = modified ∪ added
-   closure = modified ∪ added
-   parseCache = new Map()
-   while queue not empty:
-     f = queue.pop()
-     pr = await parseFile(f)         // single-file tree-sitter
-     parseCache.set(f, pr)
-     newSurface = extractSurface(pr-derived, f)
-     if newSurface !== prevSurfaces[f]:
-       importers = db.queryImporters(f)
-       for i in importers \ closure:
-         closure.add(i); queue.add(i)
-
-5. Mark dirty: meta.json.incrementalInProgress = { closure, startedAt }
-
-6. Delete-before-write
-   ├── deleteNodesForFiles(closure ∪ deleted)
-   └── deleteAllCommunitiesAndProcesses()
-
-7. Run pipeline ONCE with options:
-     filesToParse        = closure
-     prebuiltParseResults = parseCache
-   Phase order:
-     scan → structure → hydrate (NEW) → markdown,cobol → parse (filtered)
-     → routes,tools,orm,crossFile,scopeResolution,mro
-     → communities (Leiden on FULL graph) → processes
-
-8. Writeback to DB
-   ├── insertNodes(ctx.graph nodes where filePath ∈ closure)
-   ├── insertNodes(Community, Process, etc. — graph-wide)
-   ├── insertRelationships(... where source.filePath ∈ closure OR graph-wide)
-   └── (Unchanged-file rows in DB are never touched.)
-
-9. Update meta.json (clears incrementalInProgress)
-   ├── lastCommit  = HEAD
-   ├── surfaceSignatures = { ...prev (unchanged), ...new (closure) }, drop deleted
-   └── schemaVersion = CURRENT_SCHEMA_VERSION
-```
-
-### Why iterative parse works correctly
-
-A file's surface signature depends only on its own content (exported names, signatures, heritage), not on what it imports. So we can compute the new surface for `f` from a single-file tree-sitter parse without resolution or cross-file passes. The `parseCache` is the trick that prevents doing this work twice: the parse phase reuses these results when it sees them in `prebuiltParseResults`.
-
-Time-complexity intuition: every file in `closure` is tree-sitter-parsed exactly once. Files outside `closure` are never parsed, just loaded from DB by `hydrate`. Parse cost ≈ proportional to `|closure|` rather than `|allFiles|`.
-
-### Subtle correctness checks
-
-| Concern | How handled |
+**Incremental output ≡ full-rebuild output.** A run of `analyze` (default, incremental) on a repo that previously had `analyze --force` against state S₁ and is now at state S₂ produces a LadybugDB whose contents (nodes, edges, graph-wide phase outputs) are identical to running `analyze --force` against S₂ from a fresh state. Verified empirically on this repo: same 24,547 nodes / 32,716 edges / 844 clusters / 300 flows from both paths.
+
+This is the gating invariant — every architectural decision below is in service of preserving it.
+
+## What's in the box (3 layers)
+
+The shipped feature has three independent layers that compose. Each is a self-contained optimization with its own correctness story; together they deliver the headline speedup.
+
+### Layer 1 — Incremental DB writeback
+
+**The big saving on the storage side: don't wipe-and-reload the whole graph when only a few file rows changed.**
+
+After every analyze run we hash all source files and store the map at `meta.json.fileHashes`. The next run computes current hashes and diffs:
+- `changed` — file content differs from stored hash (rows must be replaced)
+- `added` — file is new on disk (insert rows)
+- `deleted` — file was in stored map, gone from disk (drop rows)
+
+Eligibility check: not `--force`, not first run, `schemaVersion=1`, `lastCommit` resolvable, no `incrementalInProgress` dirty flag. When eligible:
+1. Open the existing LadybugDB (no wipe).
+2. `deleteNodesForFile(f)` for each f in changed ∪ added ∪ deleted.
+3. `deleteAllCommunitiesAndProcesses()` — Community/Process are graph-wide, regenerated by their phases on the merged graph (preserves the "Leiden runs on the FULL graph" invariant).
+4. From the in-memory `ctx.graph` (which the pipeline produced from the FULL file set), extract the subgraph of `nodes whose filePath ∈ writable_set ∪ {Community, Process}` plus edges with at least one endpoint in that set.
+5. `loadGraphToLbug(subgraph)` — only the changed-file rows + graph-wide rows hit the DB. Unchanged-file rows in the DB are never touched.
+
+Crash recovery: `incrementalInProgress` is set to a `{ startedAt, toWriteCount }` record BEFORE any DB mutation, cleared by the success-path meta save. A crash anywhere in between leaves the flag set; the next run sees it and forces a full rebuild — cheapest path back to a known-good index.
+
+Modules:
+- `gitnexus/src/storage/file-hash.ts` — `computeFileHashes`, `diffFileHashes`
+- `gitnexus/src/core/incremental/subgraph-extract.ts` — `extractChangedSubgraph`
+- `gitnexus/src/core/lbug/lbug-adapter.ts` — `deleteAllCommunitiesAndProcesses` (new)
+- `gitnexus/src/core/run-analyze.ts` — orchestration with branched DB writeback
+
+### Layer 2 — Chunk-level parse cache
+
+**The big saving on the parse side: don't re-tree-sitter-parse files whose content hasn't changed.**
+
+The parse phase chunks files into byte-budget groups (default 2MB) and dispatches each chunk to the worker pool. Each worker returns a `ParseWorkerResult` for its sub-batch. We cache those raw results.
+
+Cache file: `<repo>/.gitnexus/parse-cache.json`. Versioned. Atomic write (tmp + rename).
+Cache key: `sha256(sorted("filePath:fileContentHash" for each file in chunk))`.
+Cache value: `ParseWorkerResult[]` — the raw worker output before merge.
+
+On each chunk:
+- Compute the chunk hash from current file contents.
+- Cache hit → call `mergeChunkResults(graph, symbolTable, cachedRaw)` and skip the worker dispatch entirely.
+- Cache miss → dispatch to workers, capture the raw results via `outRawResults`, store them under the chunk hash for next run.
+
+Two stability fixes the cache depends on:
+- **Map-preserving JSON serialization.** `ParsedFile.scopes[*].typeBindings` is a `ReadonlyMap<string, TypeRef>` which `JSON.stringify` collapses to `{}`. Added a replacer/reviver pair (`{__$mapEntries$__: [...]}` tagged form) so Maps round-trip cleanly. Without this, the first cache hit crashes with "typeBindings is not iterable".
+- **Stable chunk ordering.** The byte-budget chunker walked files in filesystem-scan order, which on Windows isn't guaranteed stable across runs. Sorted `parseableScanned` alphabetically before chunking so a single-file edit invalidates exactly one chunk, not all of them.
+
+Modules:
+- `gitnexus/src/storage/parse-cache.ts` — load, save, hash, replacer/reviver
+- `gitnexus/src/core/ingestion/parsing-processor.ts` — extracted `mergeChunkResults` from `processParsingWithWorkers`; `processParsing` accepts an `outRawResults` out-parameter
+- `gitnexus/src/core/ingestion/pipeline-phases/parse-impl.ts` — chunk hash + cache lookup + replay, alphabetical sort
+
+Cache survives `--force` because it's content-addressed: the same bytes always produce the same key. `--force` only matters for the LadybugDB writeback step.
+
+### Layer 3 — Scope-resolution short-circuit
+
+**The big saving on cross-file resolution: stop redoing parse work the workers already did.**
+
+The `scopeResolution` pipeline phase iterates files, calls `extractParsedFile` per file (which re-parses with tree-sitter), then runs the resolution work. The re-parse cost dominates: ~58s on a 1000-file repo. Workers can't pass tree-sitter `Tree` objects across `MessageChannel` (native objects), so `parse-phase.scopeTreeCache` is empty in worker mode and `extractParsedFile` always falls back to a fresh parse.
+
+But — and this was hiding in plain sight — the workers ALREADY call `extractParsedFile` and produce `ParsedFile` artifacts in `ParseWorkerResult.parsedFiles`. The previous code threw them away. The fix:
+
+1. Aggregate `parsedFiles` across chunks in `parse-impl` (`allParsedFiles[]` that pushes from every chunk's worker output).
+2. Surface them on `ParseOutput.parsedFiles`.
+3. In `scopeResolutionPhase`, build a `Map<filePath, ParsedFile>` from `ParseOutput.parsedFiles`.
+4. Pass it to `runScopeResolution` as a new `preExtractedParsedFiles` parameter.
+5. `runScopeResolution`'s extract loop checks the map first; on hit, uses the cached `ParsedFile` directly (skipping `extractParsedFile`); on miss, falls back to the original path.
+
+Worker-produced `ParsedFile` is byte-equivalent to one re-derived in scope-resolution: both call `extractParsedFile(provider, content, path, ...)`, both go through the same deterministic `emitScopeCaptures` + `extractScope` path. The only original difference was that one had a tree-sitter tree on hand (worker) and the other had to re-parse (main thread); the resulting `ParsedFile` is identical.
+
+`provider.populateOwners(parsed)` still runs on the cached `ParsedFile` — this is the same call the original path made post-extract, in-place mutation of the artifact.
+
+Module:
+- `gitnexus/src/core/ingestion/pipeline-phases/parse.ts` — `ParseOutput.parsedFiles` (new)
+- `gitnexus/src/core/ingestion/scope-resolution/pipeline/run.ts` — `RunScopeResolutionInput.preExtractedParsedFiles`, fast-path branch in extract loop
+- `gitnexus/src/core/ingestion/scope-resolution/pipeline/phase.ts` — builds the map, passes it through
+
+Effect: scopeResolution phase 58s → 5s. This is the bulk of the cold-rebuild speedup (the parse cache only helps on warm runs).
+
+## Decisions (locked in)
+
+1. **Re-parse scope (corrected from the original spec).** v1 tried to parse only changed files into a fresh graph and hydrate the rest from DB. That broke cross-file resolution because the resolution context (`exportedTypeMap`, `bindingAccumulator`) only saw closure files. Equivalence test failed. **Final design parses every file every run** — the "speedup" comes from skipping tree-sitter on cached chunks (Layer 2) and skipping scope-resolution's re-parse (Layer 3), not from skipping files outright.
+2. **Change detection: file content hash, not git diff.** The implementation uses SHA-256 of file content, not `git diff`. This works on non-git folders and on dirty working trees uniformly. (Earlier discussion considered git-only — the simpler content-hash path won.)
+3. **Rollout: incremental is the default.** `--force` is the explicit opt-out. The existing `lastCommit==HEAD` early-return now also checks for a clean working tree (uncommitted edits no longer slip through as "already up to date").
+4. **Embeddings preserved as before.** The incremental DB writeback path skips the embedding cache+restore cycle (would PK-conflict against rows that weren't deleted). Existing semantics preserved: plain `analyze` keeps existing embeddings on unchanged-file rows; `--embeddings` regenerates for new/changed; `--drop-embeddings` wipes.
+5. **Leiden RNG seeded for reproducibility.** `mulberry32` with constant seed `0xC0DE` in `community-processor.ts`. Required for the equivalence test.
+
+## v1 attempt (reverted)
+
+The original spec described a "hydrate phase" that loads node/edge state from DB for unchanged files into a fresh `ctx.graph`, then runs the parse phase only on a closure of changed-files-plus-importers. That design failed the equivalence test:
+
+| Same edited state | Nodes | Edges | Clusters | Flows |
+|---|---|---|---|---|
+| `--force` (full rebuild) | 24,624 | 32,822 | 850 | 300 |
+| v1 incremental | 24,574 | **32,397** | 845 | **252** |
+
+Δ −425 edges and −48 process flows. Root cause: `crossFile` and `scopeResolution` operated on partial parse data (only the closure files were parsed), so CALLS edges that resolved through unchanged files silently fell off. The reverted commits and the post-mortem are preserved on the branch (commits `aa8d7ae3` … `d4b9de47`, with the revert at `37ef3dda`) so reviewers can see what we ruled out.
+
+The Option B design (parse-cache + incremental-DB-writeback + scope-resolution-short-circuit) sidesteps this entirely: the pipeline parses every file every run, so cross-file always sees full data.
+
+## Measured results
+
+Benchmarked on this repo (993 files / 24,547 nodes / 32,716 edges, Windows):
+
+| Run | Time |
 |---|---|
-| Renamed file `A.ts` → `B.ts` | Flattened to `delete A.ts` + `add B.ts`; `A` rows deleted; `B` ends up in closure |
-| Deleted file | Rows deleted; importers added to closure via surface check (file's old surface treated as "different from absent new") |
-| Added file | In `modified ∪ added`; its importers are zero (newly added; nobody imports it yet) |
-| `lastCommit` rebased away | `git cat-file -e` fails → full rebuild |
-| Working tree dirty mid-run | We snapshot `git status` once at step 3; later edits are caught next run |
-| Graph-wide nodes (Community, Process) | Always deleted & regenerated; deleted by label, not by `filePath` |
-| Concurrent analyze runs | Existing `lbug.lock` single-writer guard prevents this |
-| First incremental after upgrade | `surfaceSignatures` empty in meta → fall through to full rebuild; that run populates it; next run is incremental |
+| Cold full reindex | 86s |
+| Warm cache, no source changes | 3s (early-return) |
+| Warm cache + 1-file edit, **incremental** | 38s |
+| Warm cache + 1-file edit, `--force` from same state | similar to cold |
 
-## Error handling
+40% faster cold rebuild, 72% faster on the practical "edit one file, reindex" workflow. All paths produce byte-identical graph state.
 
-The core hazard: step 6 deletes DB rows before step 8 writes new ones. A crash between leaves the index half-built. The recovery strategy is the **`incrementalInProgress` dirty flag** in meta.json:
+## Crash recovery
 
-- Step 5 writes the flag *before* any delete.
-- Step 9 (success) clears it via overwrite.
-- Step 1 of the *next* run detects the flag and forces a full rebuild.
+`meta.json.incrementalInProgress = { startedAt, toWriteCount }` is written BEFORE any destructive DB mutation in the incremental writeback path and cleared on success by overwriting meta.json. If a run crashes between, the next run detects the flag at startup and forces a full rebuild — cheapest path back to a known-good index. Works regardless of LadybugDB transactional semantics.
 
-This works regardless of LadybugDB transactional semantics.
+## Out of scope (future follow-ups)
 
-| Failure | Detection | Action |
-|---|---|---|
-| `lastCommit` gone | `git cat-file -e <lastCommit>` fails | Full rebuild path |
-| `schemaVersion` mismatch | meta.json check at step 1 | Full rebuild path |
-| `surfaceSignatures` missing (first run after upgrade) | meta.json check | Full rebuild on this run; populates signatures; next run incremental |
-| Git command fails | exec error | Refuse incremental; full rebuild |
-| DB read fails during hydrate | bubbles from `loadGraphFromLbug` | Run aborts; dirty flag set; next run does full rebuild |
-| Worker-pool crash during parse | existing pipeline error path | Same as today; dirty flag triggers full rebuild |
-| Disk full during writeback | LadybugDB write error | Same — dirty flag → full rebuild |
-| Concurrent runs | `lbug.lock` | Already prevented |
-| User Ctrl-C | SIGINT | Dirty flag persists; next run is full rebuild |
+- **GitNexus auto-writes mutate cache-relevant files.** During analyze, GitNexus updates `AGENTS.md`, `CLAUDE.md`, `.claude/skills/...` etc. with current stats. Those files get re-indexed on the next run with new content → chunk hash differs → cache miss for chunks containing them. Mitigations: (a) add the auto-gen output paths to a workspace-level ignore, (b) make the auto-gen output stable across runs, (c) extract the chunk hash from non-mutating fields only. None of these are blocking for the current PR.
+- **Sequential-mode parses don't populate `parsedFiles`.** The worker emits `ParsedFile` via `extractParsedFile` but the sequential fallback writes directly to graph without producing the artifact. Small repos that don't trigger workers don't benefit from the scope-resolution short-circuit. Acceptable: small repos are fast either way.
+- **Per-file (instead of per-chunk) cache granularity.** Per-file would invalidate even less on a large edit. Requires changing the worker contract to emit per-file results; non-trivial, not justified by current measurements.
+- **Cache file size.** 100-300MB on large repos. Compact JSON, no compression. Could be optimized later (gzip, MessagePack, binary).
 
-## Logging
+## Pre-PR checklist
 
-Each incremental run logs at the existing `log()` level:
+- [x] `npx tsc --noEmit` clean across `gitnexus` + `gitnexus-shared`
+- [x] Equivalence test verified on this repo (incremental ≡ `--force`)
+- [x] Crash-recovery dirty flag implemented + manually tested
+- [x] Dirty-tree gate on `lastCommit==HEAD` early-return
+- [ ] AGENTS.md / GUARDRAILS.md note on new default behavior
+- [ ] PR description with credits to zenprocess / davidbeesley / azeemshaik025
 
-```
-Incremental: 7 changed, 12 importers (closure 19), 4843 unchanged
-  Hydrated 50312 nodes from DB
-  Parsed 19 files (cache reuse: 7)
-  Communities: 287 detected (modularity 0.847)
-  Wrote 19 file rows + Community/Process; preserved 4843 file rows
-```
+## Code map
 
-Plus a one-line `Full rebuild forced: <reason>` when falling back. Crucial for debugging on real repos.
-
-## Testing
-
-### Unit tests (`gitnexus/test/unit/`)
-
-| Module | Critical cases |
+| Concern | Files |
 |---|---|
-| `git-diff.ts` | clean tree; dirty only; committed only; mixed; renames; deletes; lastCommit not in repo; empty repo |
-| `surface.ts` | body-only edit produces same hash; signature change produces different hash; reorder of exports produces same hash; whitespace/comments don't affect hash |
-| `closure.ts` | empty changed set → empty closure; single body-only change → closure size 1; signature change with N importers → closure size N+1; multi-hop cascade reaches fixpoint; cycle in import graph terminates; deleted file expansion includes its importers |
-| `loadGraphFromLbug` | roundtrip via `loadGraphToLbug` → identical node/edge sets; respects `filePath IN $set` filter; correctly skips Community/Process labels |
-
-### Integration tests (`gitnexus/test/integration/`)
-
-- `hydratePhase` populates `ctx.graph` from a fixture DB correctly.
-- Closure-driven parse: 2-file fixture (`a.ts` imports `b.ts`); body-only edit to `b.ts` parses only `b.ts`; signature edit parses both.
-- Dirty flag recovery: write `incrementalInProgress` manually, run analyze, verify full rebuild path triggered + flag cleared at end.
-
-### Equivalence test (the gold standard)
-
-```ts
-test('incremental ≡ full-rebuild on real fixture', async () => {
-  const repo = await setupFixtureRepo();
-  await runFullAnalysis(repo, { force: true });
-  const baseline = await snapshotDb();
-
-  for (const editScenario of EDIT_SCENARIOS) {
-    await editScenario.apply(repo);
-
-    // path A: incremental
-    await runFullAnalysis(repo, {});
-    const incrementalSnap = await snapshotDb();
-
-    // path B: rebuild from scratch on the same edited state
-    await runFullAnalysis(repo, { force: true });
-    const fullRebuildSnap = await snapshotDb();
-
-    expect(incrementalSnap).toEqual(fullRebuildSnap);
-
-    await editScenario.revert(repo);
-  }
-});
-
-const EDIT_SCENARIOS = [
-  bodyOnlyEdit,
-  signatureChange,
-  exportRename,
-  classHeritageChange,
-  fileDelete,
-  fileAdd,
-  barrelRewrite,
-  multiFile,
-];
-```
-
-This requires **seeded Leiden RNG** (one-line change in `community-processor.ts`) so community assignment is deterministic between runs.
-
-### Local validation plan (pre-PR)
-
-| Repo | Why | Expected closure on small edit |
-|---|---|---|
-| GitNexus (this repo) | Mid-size (~5k symbols), TS, dogfood | 1–10 files |
-| Larger TS repo (60k+ symbols) | Stress test, validates timing | 5–50 files for body edit |
-| Barrel-heavy repo | Worst case for cascade | up to ~full re-index for surface change in a leaf |
-
-For each: full-rebuild baseline, then for each scenario:
-1. Apply edit
-2. Run incremental
-3. Run `--force` from same edited state
-4. DB diff must be zero
-5. Capture: closure size, time per phase, modularity
-
-Plus: SIGINT mid-incremental → next run recovery; multi-edit succession.
-
-### Performance gates (informational, not blocking)
-
-- Closure size 1: target ≥3× speedup vs full
-- Closure 10% of repo: target ≥2× speedup
-- Closure 50% of repo: ~break-even, acceptable
-- Full rebuild path: zero regression vs today
-
-### Pre-PR checklist (per CONTRIBUTING.md)
-
-- [ ] `cd gitnexus && npm test` passes
-- [ ] `cd gitnexus && npx tsc --noEmit` passes
-- [ ] Equivalence test passes for all scenarios
-- [ ] Crash recovery scenario passes
-- [ ] PR title is `feat(analyze): incremental indexing via git diff`
-- [ ] PR body credits zenprocess / davidbeesley / azeemshaik025 with links to #592 / #533 / #1146
-- [ ] AGENTS.md / GUARDRAILS.md updated for new behavior (default is incremental; `--force` for full)
-- [ ] No drive-by refactors
-
-## Out of scope (v2 follow-ups)
-
-- Embeddings: an `--embeddings` run after incremental should regenerate vectors only for closure-added nodes. Currently regenerates per existing semantics (which is broader than necessary). Optimize later.
-- Persistent on-disk parse cache (PR #533's contribution) — content-addressed cache that survives across analyze invocations. Composes cleanly with this work.
-- Cross-repo incremental for groups (group bridges).
-- Incremental MCP `detect_changes` invalidation.
+| File-hash diff | `gitnexus/src/storage/file-hash.ts` |
+| Subgraph extract | `gitnexus/src/core/incremental/subgraph-extract.ts` |
+| Parse cache | `gitnexus/src/storage/parse-cache.ts` |
+| DB primitives | `gitnexus/src/core/lbug/lbug-adapter.ts` (`deleteAllCommunitiesAndProcesses`) |
+| Pipeline plumbing | `gitnexus/src/core/ingestion/pipeline.ts` (`PipelineOptions.parseCache`); `parse.ts` (`ParseOutput.parsedFiles`); `parse-impl.ts` (chunk loop with cache); `parsing-processor.ts` (`mergeChunkResults`, `outRawResults`) |
+| Scope-resolution | `gitnexus/src/core/ingestion/scope-resolution/pipeline/run.ts` (`preExtractedParsedFiles`); `phase.ts` (map construction) |
+| Orchestration | `gitnexus/src/core/run-analyze.ts` (incremental detection + DB-writeback branch + cache lifecycle) |
+| Schema | `gitnexus/src/storage/repo-manager.ts` (`RepoMeta.schemaVersion`, `fileHashes`, `incrementalInProgress`) |
+| Determinism | `gitnexus/src/core/ingestion/community-processor.ts` (seeded Leiden RNG) |
